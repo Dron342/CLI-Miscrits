@@ -17,6 +17,15 @@ from ..account_plan import AccountPlanRunner, default_plan_config, get_account_p
 from ..accounts import credentials_path, get_account, list_accounts, remove_account, save_account, session_path
 from ..arena import ArenaRunConfig, ArenaRunner
 from ..asset_cache import AssetCache
+from ..auto_update import (
+    clear_resume_state,
+    consume_resume_state,
+    git_update_capability,
+    install_git_tag,
+    restart_current_process,
+    resume_payload,
+    save_resume_state,
+)
 from ..battle_learning import ai_dashboard, learning_status, load_battle_history, load_battle_log, load_battle_log_index, set_ai_weight
 from ..breeding import BreedConfig, BreedRunner, load_breed_logs
 from ..config import DATA_DIR
@@ -35,6 +44,15 @@ ARENA_JOBS_LOCK = threading.RLock()
 MAX_ARENA_JOBS = 12
 PLAN_JOBS: dict[str, dict[str, Any]] = {}
 PLAN_JOBS_LOCK = threading.RLock()
+AUTO_UPDATE_LOCK = threading.RLock()
+AUTO_UPDATE_INTERVAL_SECONDS = 300.0
+AUTO_UPDATE_STATE: dict[str, Any] = {
+    "phase": "idle",
+    "last_checked_at": 0.0,
+    "last_result": {},
+    "target_tag": "",
+    "error": "",
+}
 
 
 class MiscritsWebHandler(BaseHTTPRequestHandler):
@@ -47,10 +65,20 @@ class MiscritsWebHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/status":
             client = MiscritsClient()
-            self._send_json({"logged_in": client.is_logged_in(), "credentials": credentials_status(), "app_version": __version__})
+            self._send_json(
+                {
+                    "logged_in": client.is_logged_in(),
+                    "credentials": credentials_status(),
+                    "app_version": __version__,
+                    "auto_update": auto_update_status(),
+                }
+            )
             return
         if parsed.path == "/api/update-check":
             self._send_json(check_for_updates())
+            return
+        if parsed.path == "/api/update-status":
+            self._send_json({"ok": True, **auto_update_status()})
             return
         if parsed.path == "/api/auth-bootstrap":
             self._handle_auth_bootstrap()
@@ -692,6 +720,8 @@ def run_server(host: str, port: int) -> None:
     print(f"CLI Miscrits web UI: http://{host}:{port}")
     for url in local_network_urls(host, port):
         print(f"Phone/LAN URL: {url}")
+    resume_jobs_after_update()
+    start_auto_update_monitor()
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
@@ -786,6 +816,21 @@ def arena_config_from_body(body: dict[str, Any]) -> ArenaRunConfig:
     )
 
 
+def arena_config_payload(config: ArenaRunConfig) -> dict[str, Any]:
+    return {
+        "mode": config.mode,
+        "timeout_seconds": config.timeout_seconds,
+        "max_turns": config.max_turns,
+        "dry_run": config.dry_run,
+        "prepare": config.prepare,
+        "location_id": config.target_location_id,
+        "area_id": config.target_area_id,
+        "repeat_count": config.repeat_count,
+        "repeat_delay_seconds": config.repeat_delay_seconds,
+        "stop_on_error": config.stop_on_error,
+    }
+
+
 def optional_int_default(value: Any, default: int) -> int:
     if value in (None, ""):
         return default
@@ -838,6 +883,7 @@ def create_arena_job(config: ArenaRunConfig, account_id: str = "") -> dict[str, 
             "delay_seconds": config.repeat_delay_seconds,
             "stop_on_error": config.stop_on_error,
         },
+        "config": arena_config_payload(config),
     }
     with ARENA_JOBS_LOCK:
         ARENA_JOBS[job_id] = job
@@ -1368,6 +1414,206 @@ def current_plan_job_unlocked(account_id: str = "") -> dict[str, Any] | None:
         return PLAN_JOBS.get(account_id)
     running = [job for job in PLAN_JOBS.values() if job.get("status") == "running"]
     return max(running, key=lambda item: float(item.get("updated_at", 0) or 0)) if running else None
+
+
+def auto_update_status() -> dict[str, Any]:
+    with AUTO_UPDATE_LOCK:
+        return json.loads(json.dumps(AUTO_UPDATE_STATE, ensure_ascii=False))
+
+
+def start_auto_update_monitor() -> None:
+    def monitor() -> None:
+        time.sleep(15.0)
+        while True:
+            try_auto_update_once()
+            time.sleep(AUTO_UPDATE_INTERVAL_SECONDS)
+
+    threading.Thread(target=monitor, name="auto-update-monitor", daemon=True).start()
+
+
+def try_auto_update_once() -> None:
+    with AUTO_UPDATE_LOCK:
+        if AUTO_UPDATE_STATE.get("phase") not in {"idle", "blocked"}:
+            return
+        AUTO_UPDATE_STATE.update({"phase": "checking", "last_checked_at": time.time(), "error": ""})
+    result = check_for_updates()
+    with AUTO_UPDATE_LOCK:
+        AUTO_UPDATE_STATE["last_result"] = result
+    if not result.get("ok") or not result.get("update_available"):
+        with AUTO_UPDATE_LOCK:
+            AUTO_UPDATE_STATE["phase"] = "idle"
+        return
+    capability = git_update_capability()
+    if not capability.get("ok"):
+        log_event(
+            "auto_update_blocked",
+            category="update",
+            level="warning",
+            source="auto_update",
+            initiator="cli",
+            reason=str(capability.get("reason", "")),
+            payload=capability,
+        )
+        with AUTO_UPDATE_LOCK:
+            AUTO_UPDATE_STATE.update(
+                {
+                    "phase": "blocked",
+                    "target_tag": result.get("latest_tag", ""),
+                    "error": capability.get("reason", ""),
+                }
+            )
+        return
+    target_tag = str(result.get("latest_tag", "") or "")
+    with AUTO_UPDATE_LOCK:
+        AUTO_UPDATE_STATE.update({"phase": "stopping", "target_tag": target_tag})
+    log_event(
+        "auto_update_requested",
+        category="update",
+        source="auto_update",
+        initiator="cli",
+        payload={"target_tag": target_tag},
+    )
+    request_jobs_stop_for_update()
+    wait_for_jobs_to_stop()
+    intents = capture_resume_intents()
+    save_resume_state(resume_payload(intents, target_tag, __version__))
+    with AUTO_UPDATE_LOCK:
+        AUTO_UPDATE_STATE["phase"] = "installing"
+    installed = install_git_tag(target_tag)
+    if not installed.get("ok"):
+        clear_resume_state()
+        resume_captured_intents(intents)
+        log_event(
+            "auto_update_failed",
+            category="update",
+            level="error",
+            source="auto_update",
+            initiator="cli",
+            reason=str(installed.get("reason", "")),
+            payload=installed,
+        )
+        with AUTO_UPDATE_LOCK:
+            AUTO_UPDATE_STATE.update({"phase": "idle", "error": installed.get("reason", "")})
+        return
+    log_event(
+        "auto_update_installed",
+        category="update",
+        source="auto_update",
+        initiator="cli",
+        payload={"target_tag": target_tag, "resume_intents": intents},
+    )
+    restart_current_process()
+
+
+def capture_resume_intents() -> list[dict[str, Any]]:
+    intents: list[dict[str, Any]] = []
+    with PLAN_JOBS_LOCK:
+        for job in PLAN_JOBS.values():
+            if job.get("update_stop_requested"):
+                intents.append(
+                    {
+                        "kind": "plan",
+                        "account_id": str(job.get("account_id", "") or ""),
+                        "run_forever": bool(job.get("run_forever", True)),
+                    }
+                )
+    with ARENA_JOBS_LOCK:
+        for job in ARENA_JOBS.values():
+            if not job.get("update_stop_requested"):
+                continue
+            config = remaining_arena_config(job)
+            if config is None:
+                continue
+            intents.append(
+                {
+                    "kind": "arena",
+                    "account_id": str(job.get("account_id", "") or ""),
+                    "config": config,
+                }
+            )
+    return intents
+
+
+def remaining_arena_config(job: dict[str, Any]) -> dict[str, Any] | None:
+    config = job.get("config", {}) if isinstance(job.get("config"), dict) else {}
+    if not config:
+        return None
+    payload = json.loads(json.dumps(config, ensure_ascii=False))
+    repeat_count = int(payload.get("repeat_count", 1) or 1)
+    if repeat_count > 0:
+        progress = job.get("progress", {}) if isinstance(job.get("progress"), dict) else {}
+        loop = progress.get("loop", {}) if isinstance(progress.get("loop"), dict) else {}
+        completed = int(loop.get("completed", 0) or 0)
+        remaining = max(0, repeat_count - completed)
+        if remaining <= 0:
+            return None
+        payload["repeat_count"] = remaining
+    return payload
+
+
+def request_jobs_stop_for_update() -> None:
+    now = time.time()
+    with PLAN_JOBS_LOCK:
+        for job in PLAN_JOBS.values():
+            if job.get("status") != "running":
+                continue
+            job["stop_requested"] = True
+            job["update_stop_requested"] = True
+            job["updated_at"] = now
+            active = job.get("active_arena")
+            if isinstance(active, dict):
+                active["stop_requested"] = True
+                active["update_stop_requested"] = True
+                active["updated_at"] = now
+    with ARENA_JOBS_LOCK:
+        for job in ARENA_JOBS.values():
+            if job.get("status") == "running":
+                job["stop_requested"] = True
+                job["update_stop_requested"] = True
+                job["updated_at"] = now
+
+
+def wait_for_jobs_to_stop() -> None:
+    while True:
+        with PLAN_JOBS_LOCK:
+            plans_running = any(job.get("status") == "running" for job in PLAN_JOBS.values())
+        with ARENA_JOBS_LOCK:
+            arenas_running = any(job.get("status") == "running" for job in ARENA_JOBS.values())
+        if not plans_running and not arenas_running:
+            return
+        time.sleep(1.0)
+
+
+def resume_jobs_after_update() -> None:
+    payload = consume_resume_state()
+    intents = payload.get("intents", []) if isinstance(payload.get("intents"), list) else []
+    if not intents:
+        return
+    resume_captured_intents(intents)
+    log_event(
+        "auto_update_resumed",
+        category="update",
+        source="auto_update",
+        initiator="cli",
+        payload={
+            "from_version": payload.get("from_version", ""),
+            "target_tag": payload.get("target_tag", ""),
+            "resume_intents": intents,
+        },
+    )
+
+
+def resume_captured_intents(intents: list[dict[str, Any]]) -> None:
+    for intent in intents:
+        if not isinstance(intent, dict):
+            continue
+        kind = str(intent.get("kind", "") or "")
+        if kind == "plan":
+            create_plan_job(str(intent.get("account_id", "") or ""), run_forever=bool(intent.get("run_forever", True)))
+        elif kind == "arena":
+            config = intent.get("config", {}) if isinstance(intent.get("config"), dict) else {}
+            if config:
+                create_arena_job(arena_config_from_body(config), str(intent.get("account_id", "") or ""))
 
 
 INDEX_HTML = """<!doctype html>

@@ -8,6 +8,7 @@ import time
 from .actions import player_summary
 from .arena import ArenaRunConfig, ArenaRunner
 from .asset_cache import AssetCache
+from .auto_update import git_update_capability, install_git_tag, restart_current_process
 from .battle_learning import learning_status, load_battle_history, load_battle_log, load_battle_log_index
 from .breeding import BreedConfig, BreedRunner, evo_from_level
 from .config import DEFAULT_CONFIG, SESSION_FILE
@@ -134,6 +135,7 @@ def main(argv: list[str] | None = None) -> int:
     serve_parser.add_argument("--port", type=int, default=8765)
 
     args = parser.parse_args(argv)
+    maybe_auto_update_before_command(args.command)
     client = MiscritsClient()
 
     try:
@@ -398,6 +400,20 @@ def parse_payload(raw: str) -> dict:
 
 def print_json(payload: object) -> None:
     print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+
+
+def maybe_auto_update_before_command(command: str) -> None:
+    if command in {"version", "check-update"}:
+        return
+    result = check_for_updates()
+    if not result.get("ok") or not result.get("update_available"):
+        return
+    capability = git_update_capability()
+    if not capability.get("ok"):
+        return
+    installed = install_git_tag(str(result.get("latest_tag", "") or ""))
+    if installed.get("ok"):
+        restart_current_process()
 
 
 if __name__ == "__main__":
