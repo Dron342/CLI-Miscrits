@@ -96,6 +96,7 @@ class BattleState:
         self.next_turn = ""
         self.pending = False
         self._last_turn_seen = 0
+        self._decision_index = 0
         self._player_switch_turns: list[int] = []
         self._utility_streak_by_pair: dict[str, int] = {}
 
@@ -196,7 +197,10 @@ class BattleState:
     def decide(self) -> dict[str, Any]:
         active = self.active_player_miscrit
         foe = self.active_foe_miscrit
+        self._decision_index += 1
         plan = self.battle_plan()
+        plan["decision_index"] = self._decision_index
+        plan["ply_index"] = self._decision_index
         if not active:
             return {"type": "none", "reason": "no_active_miscrit"}
         if is_dead(active):
@@ -929,7 +933,9 @@ def action_value_features(
         "active_element": primary_element(attacker),
         "foe_element": primary_element(defender),
         "element": str(metrics.get("element", "") or ""),
-        "turn_bucket": turn_bucket_label(int(plan.get("turns", 0) or 0)),
+        "turn_bucket": turn_bucket_label(int(plan.get("ply_index", plan.get("decision_index", plan.get("turns", 0))) or 0)),
+        "server_turn_bucket": turn_bucket_label(int(plan.get("turns", 0) or 0)),
+        "decision_progress": clamp(float(plan.get("ply_index", plan.get("decision_index", 0)) or 0.0) / 12.0, 0.0, 2.0),
         "player_hp_ratio": player_hp_ratio,
         "foe_hp_ratio": foe_hp_ratio,
         "hp_advantage": float(plan.get("hp_advantage", player_hp_ratio - foe_hp_ratio) or 0.0),
@@ -943,8 +949,6 @@ def action_value_features(
         "damage_ratio": clamp(damage / defender_max, 0.0, 1.5),
         "incoming_ratio": clamp(float(metrics.get("incoming_ratio", 0.0) or 0.0), 0.0, 2.0),
         "utility": clamp(float(metrics.get("utility", 0.0) or 0.0) / 80.0, -2.0, 2.0),
-        "candidate_rank": clamp(float(metrics.get("candidate_rank", 0.0) or 0.0) / 6.0, 0.0, 1.0),
-        "chosen_probability": clamp(float(metrics.get("chosen_probability", 1.0) or 1.0), 0.0, 1.0),
         "advantage": clamp(float(plan.get("hp_advantage", player_hp_ratio - foe_hp_ratio) or 0.0) + float(plan.get("roster_advantage", 0) or 0) * 0.25, -2.0, 2.0),
         "element_multiplier": float(metrics.get("element_multiplier", 1.0) or 1.0),
         "incoming_element_multiplier": float(metrics.get("incoming_element_multiplier", 1.0) or 1.0),

@@ -15,7 +15,7 @@ BATTLE_WEIGHTS_FILE = DATA_DIR / "battle_ai_weights.json"
 BATTLE_LOG_DIR = DATA_DIR / "battle_logs"
 BATTLE_LOG_INDEX_FILE = BATTLE_LOG_DIR / "index.json"
 BATTLE_SCHEMA_FILE = DATA_DIR / "battle_schema.json"
-BATTLE_SCHEMA_VERSION = 10
+BATTLE_SCHEMA_VERSION = 11
 MAX_HISTORY = 0
 MAX_EVENTS_PER_BATTLE = 5000
 MAX_DECISIONS_PER_BATTLE = 1000
@@ -232,10 +232,16 @@ def migrate_battle_entry(entry: dict[str, Any]) -> dict[str, Any]:
     migrated["schema_version"] = BATTLE_SCHEMA_VERSION
     events = migrated.get("events", []) if isinstance(migrated.get("events"), list) else []
     decisions = migrated.get("decisions", []) if isinstance(migrated.get("decisions"), list) else []
-    for row in decisions:
+    ply_index = 0
+    for decision_index, row in enumerate(decisions, start=1):
         if not isinstance(row, dict):
             continue
-        migrate_decision_row(row, events)
+        if bool(row.get("sent", False)) or decision_applied(row):
+            ply_index += 1
+            row_ply_index = ply_index
+        else:
+            row_ply_index = 0
+        migrate_decision_row(row, events, decision_index, row_ply_index)
     damage_samples = migrated.get("damage_samples", []) if isinstance(migrated.get("damage_samples"), list) else []
     for sample in damage_samples:
         if isinstance(sample, dict):
@@ -260,7 +266,7 @@ def migrate_battle_entry(entry: dict[str, Any]) -> dict[str, Any]:
     return migrated
 
 
-def migrate_decision_row(row: dict[str, Any], events: list[dict[str, Any]]) -> None:
+def migrate_decision_row(row: dict[str, Any], events: list[dict[str, Any]], decision_index: int = 0, ply_index: int = 0) -> None:
     decision = row.get("decision", {}) if isinstance(row.get("decision"), dict) else {}
     candidates = decision.get("candidates", []) if isinstance(decision.get("candidates"), list) else []
     decision.setdefault("reason_tags", reason_tags(decision.get("reason", "")))
@@ -270,10 +276,14 @@ def migrate_decision_row(row: dict[str, Any], events: list[dict[str, Any]]) -> N
     row.setdefault("action_type", decision.get("action_type", decision.get("type", "")))
     row.setdefault("chosen_probability", decision.get("chosen_probability", 1.0))
     row.setdefault("candidate_rank", decision.get("candidate_rank", 0))
+    row["decision_index"] = int(decision_index or row.get("decision_index", 0) or 0)
+    row["ply_index"] = int(ply_index or row.get("ply_index", 0) or 0)
     if not isinstance(row.get("state_before"), dict) or not row.get("state_before"):
         row["state_before"] = {
             "legacy_partial": True,
             "turns": row.get("turns", 0),
+            "decision_index": row.get("decision_index", 0),
+            "ply_index": row.get("ply_index", 0),
             "active": row.get("active", {}),
             "foe": row.get("foe", {}),
             "hp": row.get("hp", {}),
@@ -930,9 +940,13 @@ class BattleRecorder:
         active = active_miscrit(snapshot, "player")
         foe = active_miscrit(snapshot, "foe")
         clean = clean_decision(decision)
+        decision_index = len(self.decisions) + 1
+        ply_index = sum(1 for row in self.decisions if bool(row.get("sent", False))) + (1 if sent else 0)
         row = {
             "timestamp": time.time(),
             "turns": snapshot.get("turns", 0),
+            "decision_index": decision_index,
+            "ply_index": ply_index,
             "sent": sent,
             "executed": False,
             "decision": clean,
@@ -1156,7 +1170,9 @@ def decision_value_features(row: dict[str, Any]) -> dict[str, Any]:
         "active_element": str(active.get("element", "") or ""),
         "foe_element": str(target.get("element", "") or ""),
         "element": str(decision.get("element", "") or ""),
-        "turn_bucket": turn_bucket(row.get("turns", 0)),
+        "turn_bucket": turn_bucket(local_decision_position(row)),
+        "server_turn_bucket": turn_bucket(row.get("turns", 0)),
+        "decision_progress": clamp(float(local_decision_position(row)) / 12.0, 0.0, 2.0),
         "player_hp_ratio": float(player.get("hp_ratio", 0.0) or 0.0),
         "foe_hp_ratio": float(foe.get("hp_ratio", 0.0) or 0.0),
         "hp_advantage": float(player.get("hp_ratio", 0.0) or 0.0) - float(foe.get("hp_ratio", 0.0) or 0.0),
@@ -1255,6 +1271,10 @@ def compact_value_features(features: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in features.items() if value not in ("", [], None)}
 
 
+def local_decision_position(row: dict[str, Any]) -> int:
+    return int(row.get("ply_index", row.get("decision_index", row.get("turns", 0))) or 0)
+
+
 def turn_bucket(value: Any) -> str:
     turn = int(value or 0)
     if turn <= 1:
@@ -1278,6 +1298,7 @@ def value_feature_vector(features: dict[str, Any]) -> dict[str, float]:
         "foe_element",
         "element",
         "turn_bucket",
+        "server_turn_bucket",
     ):
         value = str(features.get(key, "") or "").strip()
         if value:
@@ -1299,6 +1320,7 @@ def value_feature_vector(features: dict[str, Any]) -> dict[str, float]:
         "incoming_ratio",
         "utility",
         "advantage",
+        "decision_progress",
         "element_multiplier",
         "incoming_element_multiplier",
         "outgoing_element_multiplier",
