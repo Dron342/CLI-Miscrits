@@ -23,6 +23,7 @@ MAX_WEIGHT = 24.0
 DAMAGE_LEARNING_RATE = 0.06
 IMITATION_LEARNING_RATE = 0.045
 IMITATION_MAX_REWARD = 0.75
+DAMAGE_ABILITY_TYPES = {"Attack", "Bleed", "Poison", "Dot", "Disease", "SwitchCurse"}
 
 
 def default_weights() -> dict[str, Any]:
@@ -503,7 +504,7 @@ class BattleRecorder:
         )
         self.events = self.events[-MAX_EVENTS_PER_BATTLE:]
 
-    def acknowledge_decision(self, opcode: int, data: Any) -> bool:
+    def acknowledge_decision(self, opcode: int, data: Any, snapshot: dict[str, Any] | None = None) -> bool:
         if not isinstance(data, dict) or str(data.get("user_id", "")) != str(self.player_id):
             return False
         action_id = int(data.get("id", 0) or 0)
@@ -522,6 +523,9 @@ class BattleRecorder:
             row["executed"] = True
             row["executed_at"] = time.time()
             row["executed_opcode"] = int(opcode)
+            if isinstance(snapshot, dict):
+                row["after_turns"] = snapshot.get("turns", row.get("turns", 0))
+                row["after_hp"] = hp_summary(snapshot)
             self.acknowledged_actions.add(fingerprint)
             self.events.append(
                 {
@@ -674,7 +678,7 @@ def post_battle_analysis(entry: dict[str, Any]) -> dict[str, Any]:
     decisions = [row for row in entry.get("decisions", []) if isinstance(row, dict)]
     events = [row for row in entry.get("events", []) if isinstance(row, dict)]
     missed_finishes = missed_finish_opportunities(decisions)
-    useless_switches = useless_switch_decisions(decisions)
+    useless_switches = useless_switch_decisions(decisions, events)
     lost_damage = lost_damage_from_ability_choices(decisions)
     losing_move = suspected_losing_move(decisions, events, str(entry.get("outcome", "")))
     severity = "ok"
@@ -723,9 +727,9 @@ def missed_finish_opportunities(decisions: list[dict[str, Any]]) -> dict[str, An
     return {"count": len(items), "items": items[:12]}
 
 
-def useless_switch_decisions(decisions: list[dict[str, Any]]) -> dict[str, Any]:
+def useless_switch_decisions(decisions: list[dict[str, Any]], events: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     items = []
-    for index, row in enumerate(decisions):
+    for row in decisions:
         if not decision_applied(row):
             continue
         decision = row.get("decision", {}) if isinstance(row.get("decision"), dict) else {}
@@ -737,12 +741,12 @@ def useless_switch_decisions(decisions: list[dict[str, Any]]) -> dict[str, Any]:
         gain = optional_float(decision.get("gain"))
         lethal_incoming = bool(decision.get("lethal_incoming", False))
         survives = decision.get("survives", True)
-        next_row = next_sent_decision(decisions, index)
+        after_state = state_after_decision(row, events or [])
         hp_drop = 0.0
         foe_drop = 0.0
-        if next_row:
-            hp_drop = hp_ratio_delta(row, next_row, "player")
-            foe_drop = hp_ratio_delta(row, next_row, "foe")
+        if after_state:
+            hp_drop = hp_ratio_delta(row, after_state, "player")
+            foe_drop = hp_ratio_delta(row, after_state, "foe")
         useless = lethal_incoming or survives is False or (gain is not None and gain <= 8.0) or (hp_drop >= 0.16 and foe_drop <= 0.04)
         if not useless:
             continue
@@ -773,8 +777,17 @@ def lost_damage_from_ability_choices(decisions: list[dict[str, Any]]) -> dict[st
         candidates = [item for item in decision.get("candidates", []) if isinstance(item, dict)] if isinstance(decision.get("candidates"), list) else []
         if not candidates:
             continue
+        chosen_candidate = next(
+            (item for item in candidates if int(item.get("id", 0) or 0) == int(decision.get("id", 0) or 0)),
+            {},
+        )
+        if is_non_damage_utility_choice(chosen_candidate):
+            continue
         chosen_damage = optional_float(decision.get("damage")) or 0.0
-        best = max(candidates, key=lambda item: float(item.get("damage", 0.0) or 0.0))
+        damage_candidates = [item for item in candidates if is_damage_candidate(item)]
+        if not damage_candidates:
+            continue
+        best = max(damage_candidates, key=lambda item: float(item.get("damage", 0.0) or 0.0))
         best_damage = float(best.get("damage", 0.0) or 0.0)
         lost = max(0.0, best_damage - chosen_damage)
         if lost < max(8.0, best_damage * 0.18):
@@ -793,17 +806,30 @@ def lost_damage_from_ability_choices(decisions: list[dict[str, Any]]) -> dict[st
     return {"total": total, "items": items[:16]}
 
 
+def is_damage_candidate(candidate: dict[str, Any]) -> bool:
+    kind = str(candidate.get("type", "") or "").strip()
+    return kind in DAMAGE_ABILITY_TYPES or float(candidate.get("damage", 0.0) or 0.0) > 0.0
+
+
+def is_non_damage_utility_choice(candidate: dict[str, Any]) -> bool:
+    if not candidate:
+        return False
+    utility = optional_float(candidate.get("utility")) or 0.0
+    damage = optional_float(candidate.get("damage")) or 0.0
+    return utility > 0.0 and damage <= 0.0 and not is_damage_candidate(candidate)
+
+
 def suspected_losing_move(decisions: list[dict[str, Any]], events: list[dict[str, Any]], outcome: str) -> dict[str, Any]:
     if outcome != "defeat":
         return {}
     best_row: dict[str, Any] | None = None
     best_score = 0.0
-    for index, row in enumerate(decisions):
+    for row in decisions:
         if not decision_applied(row):
             continue
-        next_row = next_sent_decision(decisions, index)
-        hp_drop = hp_ratio_delta(row, next_row, "player") if next_row else hp_ratio_to_finish_drop(row, events)
-        foe_drop = hp_ratio_delta(row, next_row, "foe") if next_row else 0.0
+        after_state = state_after_decision(row, events)
+        hp_drop = hp_ratio_delta(row, after_state, "player") if after_state else hp_ratio_to_finish_drop(row, events)
+        foe_drop = hp_ratio_delta(row, after_state, "foe") if after_state else 0.0
         decision = row.get("decision", {}) if isinstance(row.get("decision"), dict) else {}
         penalty = hp_drop - foe_drop * 0.45
         if str(decision.get("type", "")) == "switch" and bool(decision.get("lethal_incoming", False)):
@@ -826,11 +852,23 @@ def suspected_losing_move(decisions: list[dict[str, Any]], events: list[dict[str
     }
 
 
-def next_sent_decision(decisions: list[dict[str, Any]], index: int) -> dict[str, Any]:
-    for row in decisions[index + 1 :]:
-        if isinstance(row, dict) and decision_applied(row):
-            return row
-    return {}
+def state_after_decision(row: dict[str, Any], events: list[dict[str, Any]]) -> dict[str, Any]:
+    after_hp = row.get("after_hp", {}) if isinstance(row.get("after_hp"), dict) else {}
+    if after_hp:
+        return {"hp": after_hp}
+    after_timestamp = float(row.get("executed_at", row.get("timestamp", 0)) or 0.0)
+    candidates = [
+        event
+        for event in events
+        if isinstance(event, dict)
+        and str(event.get("event", "")) == "state"
+        and float(event.get("timestamp", 0) or 0.0) >= after_timestamp
+        and isinstance(event.get("hp"), dict)
+    ]
+    if not candidates:
+        return {}
+    event = min(candidates, key=lambda item: float(item.get("timestamp", 0) or 0.0))
+    return {"hp": event.get("hp", {})}
 
 
 def hp_ratio_delta(before: dict[str, Any], after: dict[str, Any], side: str) -> float:

@@ -26,6 +26,8 @@ from ..event_log import event_log_status, load_events, log_event
 from ..nakama import MiscritsClient, MiscritsError
 from ..player_store import load_owned_miscrits, load_player_snapshot, saved_data_status
 from ..realtime import diagnose_socket_endpoints
+from ..update_check import check_for_updates
+from .. import __version__
 
 
 ARENA_JOBS: dict[str, dict[str, Any]] = {}
@@ -36,7 +38,7 @@ PLAN_JOBS_LOCK = threading.RLock()
 
 
 class MiscritsWebHandler(BaseHTTPRequestHandler):
-    server_version = "CLI_Miscrits/0.1"
+    server_version = f"CLI_Miscrits/{__version__}"
 
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
@@ -45,7 +47,10 @@ class MiscritsWebHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/status":
             client = MiscritsClient()
-            self._send_json({"logged_in": client.is_logged_in(), "credentials": credentials_status()})
+            self._send_json({"logged_in": client.is_logged_in(), "credentials": credentials_status(), "app_version": __version__})
+            return
+        if parsed.path == "/api/update-check":
+            self._send_json(check_for_updates())
             return
         if parsed.path == "/api/auth-bootstrap":
             self._handle_auth_bootstrap()

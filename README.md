@@ -20,6 +20,8 @@ Requires Python 3.10+.
 ```powershell
 cd CLI_Miscrits
 python -m miscrits_cli doctor
+python -m miscrits_cli version
+python -m miscrits_cli check-update
 python -m miscrits_cli request-info
 python -m miscrits_cli cache-sync
 python -m miscrits_cli cache-list
@@ -42,6 +44,7 @@ Miscrit avatars are cached under `data/cache/assets/avatars/`. The web UI downlo
 
 ## Notes
 
+- Application versions follow `MAJOR.MINOR.PATCH`. Publish a Git tag such as `v0.2.0` for every released version so `check-update` can compare the local build with the latest published tag.
 - `rpc` accepts any known server RPC method:
 
 ```powershell

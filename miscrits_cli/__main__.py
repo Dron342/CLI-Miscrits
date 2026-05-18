@@ -17,16 +17,22 @@ from .event_log import load_events, log_event
 from .nakama import MiscritsClient, MiscritsError
 from .player_store import load_owned_miscrits, load_player_snapshot, saved_data_status
 from .realtime import diagnose_socket_endpoints
+from .update_check import DEFAULT_REPOSITORY, check_for_updates
 from .web.server import run_server
+from . import __version__
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="miscrits-cli")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     sub = parser.add_subparsers(dest="command", required=True)
 
+    sub.add_parser("version", help="Show application version.")
     sub.add_parser("doctor", help="Show local configuration.")
     sub.add_parser("request-info", help="Show sanitized HTTP request settings.")
     sub.add_parser("cache-list", help="Show local reference cache state.")
+    update_parser = sub.add_parser("check-update", help="Check the latest Git tag published on GitHub.")
+    update_parser.add_argument("--repo", default=DEFAULT_REPOSITORY, help="GitHub repository in owner/name format.")
 
     cache_sync_parser = sub.add_parser("cache-sync", help="Download or update CDN reference data.")
     cache_sync_parser.add_argument("names", nargs="*", help="Reference JSON names, e.g. miscrits.json.")
@@ -131,9 +137,13 @@ def main(argv: list[str] | None = None) -> int:
     client = MiscritsClient()
 
     try:
+        if args.command == "version":
+            print_json({"ok": True, "version": __version__})
+            return 0
         if args.command == "doctor":
             print_json(
                 {
+                    "app_version": __version__,
                     "api_url": DEFAULT_CONFIG.api_url,
                     "cdn_url": DEFAULT_CONFIG.cdn_url,
                     "session_file": str(SESSION_FILE),
@@ -144,6 +154,10 @@ def main(argv: list[str] | None = None) -> int:
                 }
             )
             return 0
+        if args.command == "check-update":
+            result = check_for_updates(args.repo)
+            print_json(result)
+            return 0 if result.get("ok") else 2
         if args.command == "request-info":
             print_json(client.request_info())
             return 0

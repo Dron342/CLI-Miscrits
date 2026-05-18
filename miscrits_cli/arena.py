@@ -675,7 +675,7 @@ class ArenaRunner:
                 state_model.apply(opcode, data)
                 state_model.hydrate_metadata(self.battle_metadata)
                 snapshot = enrich_battle_snapshot(state_model.snapshot(), self.metadata)
-                recorder.acknowledge_decision(opcode, data)
+                recorder.acknowledge_decision(opcode, data, snapshot)
                 recorder.observe_state(opcode, data, snapshot)
                 recorder.observe_damage_samples(damage_samples)
                 self._log(log, "battle_state", phase="battle", opcode=opcode, data=summarize_battle_data(data), battle=snapshot)
