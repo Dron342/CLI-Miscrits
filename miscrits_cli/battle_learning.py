@@ -15,7 +15,7 @@ BATTLE_WEIGHTS_FILE = DATA_DIR / "battle_ai_weights.json"
 BATTLE_LOG_DIR = DATA_DIR / "battle_logs"
 BATTLE_LOG_INDEX_FILE = BATTLE_LOG_DIR / "index.json"
 BATTLE_SCHEMA_FILE = DATA_DIR / "battle_schema.json"
-BATTLE_SCHEMA_VERSION = 9
+BATTLE_SCHEMA_VERSION = 10
 MAX_HISTORY = 0
 MAX_EVENTS_PER_BATTLE = 5000
 MAX_DECISIONS_PER_BATTLE = 1000
@@ -1170,7 +1170,6 @@ def decision_value_features(row: dict[str, Any]) -> dict[str, Any]:
         "damage_ratio": clamp(damage / foe_max_hp, 0.0, 1.5),
         "incoming_ratio": clamp(float(decision.get("incoming_ratio", 0.0) or 0.0), 0.0, 2.0),
         "utility": clamp(float(decision.get("utility", 0.0) or 0.0) / 80.0, -2.0, 2.0),
-        "candidate_rank": min(6.0, float(row.get("candidate_rank", decision.get("candidate_rank", 0)) or 0.0)) / 6.0,
         "advantage": clamp(float(row.get("advantage", 0.0) or 0.0), -2.0, 2.0),
     }
     return compact_value_features(features)
@@ -1240,7 +1239,6 @@ def candidate_value_features(row: dict[str, Any], candidate: dict[str, Any]) -> 
             "near_lethal": bool(candidate.get("near_lethal", False)),
             "incoming_ratio": clamp(float(candidate.get("incoming_ratio", base.get("incoming_ratio", 0.0)) or 0.0), 0.0, 2.0),
             "utility": clamp(float(candidate.get("utility", 0.0) or 0.0) / 80.0, -2.0, 2.0),
-            "candidate_rank": min(24.0, float(candidate.get("candidate_rank", 0) or 0.0)) / 24.0,
             "element_multiplier": float(candidate.get("element_multiplier", base.get("element_multiplier", 1.0)) or 1.0),
             "incoming_element_multiplier": float(candidate.get("incoming_element_multiplier", base.get("incoming_element_multiplier", 1.0)) or 1.0),
             "outgoing_element_multiplier": float(candidate.get("outgoing_element_multiplier", base.get("outgoing_element_multiplier", 1.0)) or 1.0),
@@ -1300,7 +1298,6 @@ def value_feature_vector(features: dict[str, Any]) -> dict[str, float]:
         "damage_ratio",
         "incoming_ratio",
         "utility",
-        "candidate_rank",
         "advantage",
         "element_multiplier",
         "incoming_element_multiplier",
