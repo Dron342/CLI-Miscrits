@@ -4,7 +4,7 @@ import random
 import re
 from typing import Any
 
-from .battle_learning import action_value_estimate, damage_kind_for_action, damage_multiplier, learned_bonus, matchup_memory, reason_tags
+from .battle_learning import action_rank_estimate, action_value_estimate, damage_kind_for_action, damage_multiplier, learned_bonus, matchup_memory, reason_tags
 
 
 BATTLE_OPCODES = {
@@ -458,7 +458,7 @@ class BattleState:
             "incoming_element_multiplier": ranked[0].get("incoming_element_multiplier", 1.0),
             "outgoing_element_multiplier": ranked[0].get("outgoing_element_multiplier", 1.0),
             "best_damage": ranked[0].get("best_damage", 0.0),
-            "candidates": ranked[:5],
+            "candidates": ranked,
         }
 
     def _best_ability_id(self, miscrit: dict[str, Any], plan: dict[str, Any] | None = None) -> int:
@@ -482,7 +482,7 @@ class BattleState:
             best["reason"] = "lethal_finish" if bool(best.get("lethal", False)) else "near_lethal_pressure"
             best["reason_tags"] = [best["reason"]]
             best["chosen_probability"] = 1.0
-            return {**best, "candidates": ranked[:6]}
+            return {**best, "candidates": ranked}
         best = ranked[0]
         best_attack = next((item for item in ranked if str(item.get("type", "") or "") == "Attack"), None)
         if best_attack and int(best_attack.get("id", 0) or 0) != int(best.get("id", 0) or 0):
@@ -498,16 +498,16 @@ class BattleState:
                 forced["chosen_probability"] = 1.0
                 forced["utility_streak_before"] = utility_streak
                 forced["attack_followup_ratio"] = followup_ratio
-                return {**forced, "candidates": ranked[:6]}
+                return {**forced, "candidates": ranked}
         explored = exploratory_ability_choice(ranked, plan or {})
         if explored:
             previous_tags = explored.get("reason_tags", reason_tags(explored.get("reason", "")))
             explored["reason"] = "explore_" + str(explored.get("reason", "alternate_ability"))
             explored["reason_tags"] = ["explore", *previous_tags]
             explored["exploration"] = True
-            return {**explored, "candidates": ranked[:6]}
+            return {**explored, "candidates": ranked}
         best["chosen_probability"] = best.get("chosen_probability", deterministic_ability_probability(ranked, plan or {}))
-        return {**best, "reason": best.get("reason", "best_scored_ability"), "candidates": ranked[:6]}
+        return {**best, "reason": best.get("reason", "best_scored_ability"), "candidates": ranked}
 
     def _utility_streak(self, active: dict[str, Any], foe: dict[str, Any]) -> int:
         return int(self._utility_streak_by_pair.get(self._pair_key(active, foe), 0) or 0)
@@ -872,6 +872,9 @@ def score_ability(ability: dict[str, Any], attacker: dict[str, Any], defender: d
     value_model = action_value_estimate(value_features)
     value_adjustment = float(value_model.get("adjustment", 0.0) or 0.0)
     score += value_adjustment
+    rank_model = action_rank_estimate(value_features)
+    rank_adjustment = float(rank_model.get("adjustment", 0.0) or 0.0)
+    score += rank_adjustment
 
     return {
         "id": int(ability.get("id", 0) or 0),
@@ -896,6 +899,10 @@ def score_ability(ability: dict[str, Any], attacker: dict[str, Any], defender: d
         "expected_value": value_model.get("expected_value", 0.0),
         "expected_value_adjustment": round(value_adjustment, 3),
         "expected_value_confidence": value_model.get("confidence", 0.0),
+        "rank_value": rank_model.get("rank_value", 0.0),
+        "rank_adjustment": round(rank_adjustment, 3),
+        "rank_confidence": rank_model.get("confidence", 0.0),
+        "value_features": value_features,
     }
 
 
@@ -2156,6 +2163,9 @@ def switch_evaluation(candidate: dict[str, Any], foe: dict[str, Any], plan: dict
     value_model = action_value_estimate(value_features)
     value_adjustment = float(value_model.get("adjustment", 0.0) or 0.0)
     score += value_adjustment
+    rank_model = action_rank_estimate(value_features)
+    rank_adjustment = float(rank_model.get("adjustment", 0.0) or 0.0)
+    score += rank_adjustment
     return {
         "id": int(candidate.get("id", 0) or 0),
         "mid": normalized_mid(candidate),
@@ -2177,6 +2187,10 @@ def switch_evaluation(candidate: dict[str, Any], foe: dict[str, Any], plan: dict
         "expected_value": value_model.get("expected_value", 0.0),
         "expected_value_adjustment": round(value_adjustment, 3),
         "expected_value_confidence": value_model.get("confidence", 0.0),
+        "rank_value": rank_model.get("rank_value", 0.0),
+        "rank_adjustment": round(rank_adjustment, 3),
+        "rank_confidence": rank_model.get("confidence", 0.0),
+        "value_features": value_features,
     }
 
 
