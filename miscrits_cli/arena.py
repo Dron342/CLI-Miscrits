@@ -57,6 +57,9 @@ TEAM_POOL_CORE_LIMIT = 20
 RECOVERABLE_REALTIME_MARKERS = (
     "timed out",
     "timed out waiting",
+    "network error:",
+    "unexpected_eof_while_reading",
+    "match not found",
     "websocket handshake failed: empty response",
     "websocket handshake failed: http 401 unauthorized",
     "realtime socket closed by server",

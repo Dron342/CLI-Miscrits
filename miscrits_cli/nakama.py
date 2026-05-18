@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import ssl
 import time
 import urllib.error
 import urllib.parse
@@ -16,6 +17,10 @@ from .storage import clear_session, load_session, save_session
 
 class MiscritsError(RuntimeError):
     pass
+
+
+SAFE_HTTP_RETRY_ATTEMPTS = 3
+SAFE_HTTP_RETRY_DELAY_SECONDS = 0.35
 
 
 @dataclass
@@ -274,14 +279,20 @@ class MiscritsClient:
         headers: dict[str, str],
     ) -> bytes:
         request = urllib.request.Request(url, data=data, headers=headers, method=method)
-        try:
-            with urllib.request.urlopen(request, timeout=self.config.timeout_seconds) as response:
-                return response.read()
-        except urllib.error.HTTPError as exc:
-            message = exc.read().decode("utf-8", errors="replace")
-            raise MiscritsError(f"HTTP {exc.code}: {message}") from exc
-        except urllib.error.URLError as exc:
-            raise MiscritsError(f"Network error: {exc.reason}") from exc
+        attempts = SAFE_HTTP_RETRY_ATTEMPTS if method.upper() == "GET" else 1
+        for attempt in range(1, attempts + 1):
+            try:
+                with urllib.request.urlopen(request, timeout=self.config.timeout_seconds) as response:
+                    return response.read()
+            except urllib.error.HTTPError as exc:
+                message = exc.read().decode("utf-8", errors="replace")
+                raise MiscritsError(f"HTTP {exc.code}: {message}") from exc
+            except urllib.error.URLError as exc:
+                if attempt < attempts and is_transient_network_error(exc):
+                    time.sleep(SAFE_HTTP_RETRY_DELAY_SECONDS * attempt)
+                    continue
+                raise MiscritsError(network_error_message(exc, retried=attempts > 1)) from exc
+        raise MiscritsError("Network error: request failed without a response.")
 
     def _basic_auth_header(self) -> str:
         token = base64.b64encode(f"{self.config.server_key}:".encode("utf-8")).decode("ascii")
@@ -307,6 +318,30 @@ class MiscritsClient:
             "X-Godot-Engine": "4.3.stable",
             "X-Miscrits-Version": self.config.client_version,
         }
+
+
+def is_transient_network_error(exc: BaseException) -> bool:
+    reason = exc.reason if isinstance(exc, urllib.error.URLError) else exc
+    if isinstance(reason, (ssl.SSLEOFError, TimeoutError, ConnectionResetError, ConnectionAbortedError)):
+        return True
+    text = str(reason).strip().lower()
+    return any(
+        marker in text
+        for marker in (
+            "unexpected_eof_while_reading",
+            "connection reset",
+            "connection aborted",
+            "timed out",
+            "temporarily unavailable",
+        )
+    )
+
+
+def network_error_message(exc: urllib.error.URLError, retried: bool) -> str:
+    if is_transient_network_error(exc):
+        suffix = " after retrying" if retried else ""
+        return f"Network error: temporary connection failure{suffix}: {exc.reason}"
+    return f"Network error: {exc.reason}"
 
 
 def token_would_expire_in(token: str, seconds: int) -> bool:

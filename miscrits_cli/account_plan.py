@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from .arena import ArenaRunConfig, ArenaRunner, arena_reward_progress
+from .arena import ArenaRunConfig, ArenaRunner, arena_reward_progress, is_recoverable_arena_error
 from .breeding import metadata_by_mid
 from .config import DATA_DIR
 from .data_cache import DataCache
@@ -130,7 +130,15 @@ class AccountPlanRunner:
         while True:
             if should_stop and should_stop():
                 return PlanRunResult(True, "stopped", state=self.load_state())
-            result = self.run_once(should_stop=should_stop)
+            try:
+                result = self.run_once(should_stop=should_stop)
+            except (MiscritsError, TimeoutError, OSError) as exc:
+                if not is_recoverable_plan_error(exc):
+                    raise
+                self.emit("plan_recoverable_error", "recovering", reason=str(exc))
+                config = self.load_config()
+                sleep_with_stop(float(config.get("tick_seconds", 20) or 20), should_stop)
+                continue
             if result.status == "stopped":
                 return result
             config = self.load_config()
@@ -547,6 +555,11 @@ def normalize_plan_config(config: dict[str, Any], *, explicit_blocks: bool) -> d
     out["blocks"] = normalize_plan_blocks(blocks)
     out["steps"] = legacy_steps_from_blocks(out["blocks"])
     return out
+
+
+def is_recoverable_plan_error(exc: BaseException | str) -> bool:
+    text = str(exc).strip().lower()
+    return is_recoverable_arena_error(exc) or "network error:" in text
 
 
 def plan_blocks(config: dict[str, Any]) -> list[dict[str, Any]]:

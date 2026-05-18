@@ -56,6 +56,13 @@ python -m miscrits_cli rpc update_location --payload "{\"locationId\":1,\"areaId
 - The implementation uses Python standard library networking so the scaffold runs without installing dependencies.
 - HTTP requests use a Godot-style client profile: explicit API port `443`, `GodotEngine/...` user agent, and version headers.
 
+## Изменения в 0.2.1
+
+- Добавлены безопасные повторы для временных сетевых сбоев при `GET`-запросах, включая TLS-обрывы `UNEXPECTED_EOF_WHILE_READING`.
+- Ошибка арены `Match not found` теперь считается восстанавливаемой, а не фатальной.
+- План больше не завершается целиком из-за временной сетевой ошибки: он переходит в восстановление и продолжает следующий цикл.
+- Версия приложения теперь видна в web-интерфейсе до входа и после входа.
+
 ## Breeding
 
 The S+ breeding planner uses only level 1 miscrits, skips team members and favorites, and avoids spending unique S+ copies unless explicitly allowed.

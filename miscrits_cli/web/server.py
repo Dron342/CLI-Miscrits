@@ -43,7 +43,7 @@ class MiscritsWebHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
         if parsed.path == "/":
-            self._send_html(INDEX_HTML)
+            self._send_html(INDEX_HTML.replace("__APP_VERSION__", __version__))
             return
         if parsed.path == "/api/status":
             client = MiscritsClient()
@@ -1452,6 +1452,7 @@ INDEX_HTML = """<!doctype html>
     .brand { display: flex; align-items: center; gap: 10px; margin-bottom: 22px; }
     .brand-mark { width: 34px; height: 34px; border-radius: 8px; background: #33a399; display: grid; place-items: center; font-weight: 800; }
     .brand h1 { margin: 0; font-size: 18px; }
+    .version-text { color: var(--muted); font-size: 12px; }
     .status-pill { margin-left: auto; border-radius: 999px; padding: 4px 8px; background: #30424b; font-size: 12px; color: #d8efef; }
     nav { display: grid; gap: 7px; }
     nav button {
@@ -2592,6 +2593,7 @@ INDEX_HTML = """<!doctype html>
         <div class="brand-mark">M</div>
         <div>
           <h1>CLI Miscrits</h1>
+          <div class="version-text">v__APP_VERSION__</div>
           <p id="authStatus">Проверяю сохранённую сессию...</p>
         </div>
       </div>
@@ -2611,6 +2613,7 @@ INDEX_HTML = """<!doctype html>
       <div class="brand">
         <div class="brand-mark">M</div>
         <h1>CLI Miscrits</h1>
+        <span class="version-text">v__APP_VERSION__</span>
         <span class="status-pill" id="status">...</span>
       </div>
       <nav>
