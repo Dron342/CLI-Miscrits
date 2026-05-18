@@ -93,10 +93,10 @@ def learned_bonus(kind: str, action_id: int, attacker: dict[str, Any], defender:
     matchup_entry = weights.get("matchups", {}).get(matchup_key(attacker, defender, kind, action_id), {})
     if isinstance(matchup_entry, dict):
         bonus += float(matchup_entry.get("weight", 0.0) or 0.0)
-    opponent_action = weights.get("opponent_actions", {}).get(action_key(kind, action_id), {})
+    opponent_action = opponent_action_entry(weights.get("opponent_actions", {}), kind, action_id)
     if isinstance(opponent_action, dict):
         bonus += float(opponent_action.get("weight", 0.0) or 0.0) * 0.65
-    opponent_matchup = weights.get("opponent_matchups", {}).get(matchup_key(attacker, defender, kind, action_id), {})
+    opponent_matchup = opponent_matchup_entry(weights.get("opponent_matchups", {}), attacker, defender, kind, action_id)
     if isinstance(opponent_matchup, dict):
         bonus += float(opponent_matchup.get("weight", 0.0) or 0.0) * 0.7
     return clamp(bonus, -MAX_WEIGHT, MAX_WEIGHT)
@@ -382,7 +382,7 @@ def ai_dashboard() -> dict[str, Any]:
         post_metrics["useless_switches"] += int(summary.get("useless_switches", 0) or 0)
         post_metrics["lost_damage"] += float(summary.get("lost_damage", 0.0) or 0.0)
         for row in entry.get("decisions", []) if isinstance(entry.get("decisions"), list) else []:
-            if not isinstance(row, dict):
+            if not isinstance(row, dict) or not decision_applied(row):
                 continue
             decision = row.get("decision", {}) if isinstance(row.get("decision"), dict) else {}
             debug = decision.get("debug", {}) if isinstance(decision.get("debug"), dict) else {}
@@ -485,6 +485,7 @@ class BattleRecorder:
     decisions: list[dict[str, Any]] = field(default_factory=list)
     events: list[dict[str, Any]] = field(default_factory=list)
     damage_samples: list[dict[str, Any]] = field(default_factory=list)
+    acknowledged_actions: set[tuple[int, str, int, int]] = field(default_factory=set)
 
     def observe_state(self, opcode: int, data: Any, snapshot: dict[str, Any]) -> None:
         if not self.start_snapshot and snapshot.get("player"):
@@ -501,6 +502,39 @@ class BattleRecorder:
             }
         )
         self.events = self.events[-MAX_EVENTS_PER_BATTLE:]
+
+    def acknowledge_decision(self, opcode: int, data: Any) -> bool:
+        if not isinstance(data, dict) or str(data.get("user_id", "")) != str(self.player_id):
+            return False
+        action_id = int(data.get("id", 0) or 0)
+        decision_type = decision_type_from_opcode(opcode)
+        if not decision_type or not action_id:
+            return False
+        fingerprint = (int(opcode), str(data.get("user_id", "")), action_id, int(data.get("turns", 0) or 0))
+        if fingerprint in self.acknowledged_actions:
+            return False
+        for row in self.decisions:
+            if decision_applied(row) or not bool(row.get("sent", False)):
+                continue
+            decision = row.get("decision", {}) if isinstance(row.get("decision"), dict) else {}
+            if str(decision.get("type", "")) != decision_type or int(decision.get("id", 0) or 0) != action_id:
+                continue
+            row["executed"] = True
+            row["executed_at"] = time.time()
+            row["executed_opcode"] = int(opcode)
+            self.acknowledged_actions.add(fingerprint)
+            self.events.append(
+                {
+                    "timestamp": row["executed_at"],
+                    "event": "decision_acknowledged",
+                    "turns": row.get("turns", 0),
+                    "opcode": int(opcode),
+                    "decision": row.get("decision", {}),
+                }
+            )
+            self.events = self.events[-MAX_EVENTS_PER_BATTLE:]
+            return True
+        return False
 
     def observe_damage_samples(self, samples: list[dict[str, Any]]) -> None:
         if not samples:
@@ -531,6 +565,7 @@ class BattleRecorder:
             "timestamp": time.time(),
             "turns": snapshot.get("turns", 0),
             "sent": sent,
+            "executed": False,
             "decision": clean_decision(decision),
             "active": compact_miscrit(active),
             "foe": compact_miscrit(foe),
@@ -544,7 +579,8 @@ class BattleRecorder:
     def finish(self, outcome: str, turns_sent: int, final_snapshot: dict[str, Any]) -> dict[str, Any]:
         if final_snapshot:
             self.last_snapshot = compact_snapshot(final_snapshot)
-        grade = grade_battle(outcome, self.start_snapshot, self.last_snapshot, turns_sent)
+        turns_executed = sum(1 for row in self.decisions if decision_applied(row))
+        grade = grade_battle(outcome, self.start_snapshot, self.last_snapshot, turns_executed)
         entry = {
             "id": self.battle_id,
             "mode": self.mode,
@@ -553,6 +589,7 @@ class BattleRecorder:
             "finished_at": time.time(),
             "outcome": outcome,
             "turns_sent": turns_sent,
+            "turns_executed": turns_executed,
             "grade": grade,
             "start": self.start_snapshot,
             "finish": self.last_snapshot,
@@ -575,7 +612,7 @@ def update_weights_from_battle(entry: dict[str, Any]) -> None:
     if abs(reward) >= 0.01:
         weights["battles"] = int(weights.get("battles", 0) or 0) + 1
         for row in entry.get("decisions", []):
-            if not isinstance(row, dict) or not row.get("sent", False):
+            if not isinstance(row, dict) or not decision_applied(row):
                 continue
             decision = row.get("decision", {})
             if not isinstance(decision, dict):
@@ -606,15 +643,14 @@ def update_opponent_imitation(weights: dict[str, Any], samples: Any) -> bool:
         ability = sample.get("ability", {}) if isinstance(sample.get("ability"), dict) else {}
         attacker = sample.get("attacker", {}) if isinstance(sample.get("attacker"), dict) else {}
         defender = sample.get("defender", {}) if isinstance(sample.get("defender"), dict) else {}
-        kind = str(ability.get("type", "Attack") or "Attack")
         action_id = int(ability.get("id", 0) or 0)
         if not action_id or not attacker or not defender:
             continue
         reward = opponent_sample_reward(sample)
         if reward <= 0:
             continue
-        update_bucket(weights["opponent_actions"], action_key(kind, action_id), reward)
-        update_bucket(weights["opponent_matchups"], matchup_key(attacker, defender, kind, action_id), reward * 0.85)
+        update_bucket(weights["opponent_actions"], action_key("ability", action_id), reward)
+        update_bucket(weights["opponent_matchups"], matchup_key(attacker, defender, "ability", action_id), reward * 0.85)
         update_bucket(weights["opponent_pair_matchups"], pair_matchup_key(attacker, defender), reward * 0.65)
         changed = True
     return changed
@@ -664,7 +700,7 @@ def post_battle_analysis(entry: dict[str, Any]) -> dict[str, Any]:
 def missed_finish_opportunities(decisions: list[dict[str, Any]]) -> dict[str, Any]:
     items = []
     for row in decisions:
-        if not row.get("sent", False):
+        if not decision_applied(row):
             continue
         decision = row.get("decision", {}) if isinstance(row.get("decision"), dict) else {}
         candidates = decision.get("candidates", []) if isinstance(decision.get("candidates"), list) else []
@@ -690,7 +726,7 @@ def missed_finish_opportunities(decisions: list[dict[str, Any]]) -> dict[str, An
 def useless_switch_decisions(decisions: list[dict[str, Any]]) -> dict[str, Any]:
     items = []
     for index, row in enumerate(decisions):
-        if not row.get("sent", False):
+        if not decision_applied(row):
             continue
         decision = row.get("decision", {}) if isinstance(row.get("decision"), dict) else {}
         if str(decision.get("type", "")) != "switch":
@@ -729,7 +765,7 @@ def lost_damage_from_ability_choices(decisions: list[dict[str, Any]]) -> dict[st
     total = 0.0
     items = []
     for row in decisions:
-        if not row.get("sent", False):
+        if not decision_applied(row):
             continue
         decision = row.get("decision", {}) if isinstance(row.get("decision"), dict) else {}
         if str(decision.get("type", "")) != "ability":
@@ -763,7 +799,7 @@ def suspected_losing_move(decisions: list[dict[str, Any]], events: list[dict[str
     best_row: dict[str, Any] | None = None
     best_score = 0.0
     for index, row in enumerate(decisions):
-        if not row.get("sent", False):
+        if not decision_applied(row):
             continue
         next_row = next_sent_decision(decisions, index)
         hp_drop = hp_ratio_delta(row, next_row, "player") if next_row else hp_ratio_to_finish_drop(row, events)
@@ -792,7 +828,7 @@ def suspected_losing_move(decisions: list[dict[str, Any]], events: list[dict[str
 
 def next_sent_decision(decisions: list[dict[str, Any]], index: int) -> dict[str, Any]:
     for row in decisions[index + 1 :]:
-        if isinstance(row, dict) and row.get("sent", False):
+        if isinstance(row, dict) and decision_applied(row):
             return row
     return {}
 
@@ -1147,6 +1183,20 @@ def clean_decision(decision: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def decision_type_from_opcode(opcode: int) -> str:
+    if int(opcode) == 1:
+        return "switch"
+    if int(opcode) in {2, 6, 3}:
+        return "ability"
+    return ""
+
+
+def decision_applied(row: dict[str, Any]) -> bool:
+    if "executed" in row:
+        return bool(row.get("executed", False))
+    return bool(row.get("sent", False))
+
+
 def hp_summary(snapshot: dict[str, Any]) -> dict[str, Any]:
     return {
         "player": side_stats(snapshot, "player"),
@@ -1191,6 +1241,42 @@ def action_key(kind: str, action_id: int) -> str:
 
 def matchup_key(attacker: dict[str, Any], defender: dict[str, Any], kind: str, action_id: int) -> str:
     return f"{int(attacker.get('mid', 0) or 0)}>{int(defender.get('mid', 0) or 0)}:{kind}:{int(action_id or 0)}"
+
+
+def opponent_action_entry(bucket: Any, kind: str, action_id: int) -> dict[str, Any]:
+    if not isinstance(bucket, dict):
+        return {}
+    canonical_key = action_key(kind, action_id)
+    canonical = bucket.get(canonical_key)
+    if canonical_key in bucket and isinstance(canonical, dict):
+        return canonical
+    suffix = f":{int(action_id or 0)}"
+    for key, value in bucket.items():
+        if str(key).endswith(suffix) and isinstance(value, dict):
+            return value
+    return {}
+
+
+def opponent_matchup_entry(
+    bucket: Any,
+    attacker: dict[str, Any],
+    defender: dict[str, Any],
+    kind: str,
+    action_id: int,
+) -> dict[str, Any]:
+    if not isinstance(bucket, dict):
+        return {}
+    canonical_key = matchup_key(attacker, defender, kind, action_id)
+    canonical = bucket.get(canonical_key)
+    if canonical_key in bucket and isinstance(canonical, dict):
+        return canonical
+    prefix = f"{int(attacker.get('mid', 0) or 0)}>{int(defender.get('mid', 0) or 0)}:"
+    suffix = f":{int(action_id or 0)}"
+    for key, value in bucket.items():
+        text = str(key)
+        if text.startswith(prefix) and text.endswith(suffix) and isinstance(value, dict):
+            return value
+    return {}
 
 
 def pair_matchup_key(attacker: dict[str, Any], defender: dict[str, Any]) -> str:

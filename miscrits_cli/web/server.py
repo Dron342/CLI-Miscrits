@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import socket
+import sys
 import threading
 import time
 import uuid
@@ -673,8 +674,16 @@ class MiscritsWebHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
 
+class MiscritsThreadingHTTPServer(ThreadingHTTPServer):
+    def handle_error(self, request: Any, client_address: tuple[str, int]) -> None:
+        error = sys.exc_info()[1]
+        if isinstance(error, (ConnectionResetError, ConnectionAbortedError, BrokenPipeError)):
+            return
+        super().handle_error(request, client_address)
+
+
 def run_server(host: str, port: int) -> None:
-    httpd = ThreadingHTTPServer((host, port), MiscritsWebHandler)
+    httpd = MiscritsThreadingHTTPServer((host, port), MiscritsWebHandler)
     print(f"CLI Miscrits web UI: http://{host}:{port}")
     for url in local_network_urls(host, port):
         print(f"Phone/LAN URL: {url}")

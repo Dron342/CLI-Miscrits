@@ -49,6 +49,7 @@ ELEMENT_WEAKNESS = {
     "Earth": "Wind",
     "Physical": "",
 }
+BASE_ELEMENTS = tuple(key for key in ELEMENT_WEAKNESS if key != "Physical")
 
 CONTROL_TYPES = {"Sleep", "Confuse", "Paralyze"}
 TURN_DENIAL_TYPES = {"Sleep"}
@@ -2222,7 +2223,21 @@ def miscrit_elements(miscrit: dict[str, Any]) -> list[str]:
         raw = str(metadata.get("element", ""))
     raw = str(miscrit.get("element", raw) or raw)
     raw = raw.replace("\\", "/").replace("|", "/").replace(",", "/")
-    parts = [part.strip() for part in raw.split("/") if part.strip()]
+    parts: list[str] = []
+    for chunk in (part.strip() for part in raw.split("/") if part.strip()):
+        if chunk in BASE_ELEMENTS or chunk == "Physical":
+            parts.append(chunk)
+            continue
+        remaining = chunk
+        split_parts: list[str] = []
+        for element in BASE_ELEMENTS:
+            if remaining.startswith(element):
+                split_parts.append(element)
+                remaining = remaining[len(element) :]
+        if split_parts and not remaining:
+            parts.extend(split_parts)
+        else:
+            parts.append(chunk)
     return parts or ["Physical"]
 
 
