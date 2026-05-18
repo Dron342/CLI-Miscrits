@@ -4,7 +4,7 @@ import random
 import re
 from typing import Any
 
-from .battle_learning import damage_kind_for_action, damage_multiplier, learned_bonus, matchup_memory, reason_tags
+from .battle_learning import action_value_estimate, damage_kind_for_action, damage_multiplier, learned_bonus, matchup_memory, reason_tags
 
 
 BATTLE_OPCODES = {
@@ -200,7 +200,7 @@ class BattleState:
         if not active:
             return {"type": "none", "reason": "no_active_miscrit"}
         if is_dead(active):
-            switch_choice = self._best_switch()
+            switch_choice = self._best_switch(plan=plan)
             if switch_choice["id"]:
                 return {"type": "switch", "id": switch_choice["id"], "reason": "active_dead", "debug": {**switch_choice, "plan": plan}}
         if not foe:
@@ -209,7 +209,7 @@ class BattleState:
                 return {"type": "ability", "id": ability_id, "reason": "best_available_attack"}
 
         ability_choice = self._best_ability(active, foe, plan)
-        switch_choice = self._best_switch(foe)
+        switch_choice = self._best_switch(foe, plan)
         if should_switch(active, foe, ability_choice, switch_choice, plan):
             return {"type": "switch", "id": switch_choice["id"], "reason": switch_choice.get("reason", "better_matchup"), "debug": {**switch_choice, "plan": plan}}
         if ability_choice["id"]:
@@ -252,6 +252,7 @@ class BattleState:
             "foe_hp_ratio": round(float(foe_state["hp_ratio"]), 4),
             "roster_advantage": roster_advantage,
             "hp_advantage": round(hp_advantage, 4),
+            "turns": int(self.turns),
             "player_switch_count": len(self._player_switch_turns),
             "last_player_switch_turn": last_switch_turn,
             "turns_since_player_switch": turns_since_switch,
@@ -428,7 +429,7 @@ class BattleState:
     def _best_switch_id(self) -> int:
         return int(self._best_switch().get("id", 0) or 0)
 
-    def _best_switch(self, foe: dict[str, Any] | None = None) -> dict[str, Any]:
+    def _best_switch(self, foe: dict[str, Any] | None = None, plan: dict[str, Any] | None = None) -> dict[str, Any]:
         foe = foe or self.active_foe_miscrit
         active = self.active_player_miscrit
         candidates = [item for item in self.player.get("miscrits", [])[1:] if isinstance(item, dict) and int(item.get("id", 0) or 0) != 0 and not is_dead(item)]
@@ -436,9 +437,9 @@ class BattleState:
             return {"id": 0, "reason": "no_alive_bench"}
         ranked = []
         for item in candidates:
-            ranked.append(switch_evaluation(item, foe))
+            ranked.append(switch_evaluation(item, foe, plan or {}))
         ranked.sort(key=lambda item: float(item["score"]), reverse=True)
-        active_eval = switch_evaluation(active, foe) if active and foe else {"score": 0.0}
+        active_eval = switch_evaluation(active, foe, plan or {}) if active and foe else {"score": 0.0}
         return {
             "id": int(ranked[0]["id"] or 0),
             "reason": ranked[0].get("reason", "better_matchup"),
@@ -846,6 +847,31 @@ def score_ability(ability: dict[str, Any], attacker: dict[str, Any], defender: d
         score += lookahead_adjustment
         reasons.extend(lookahead_reasons)
         reason = "_".join(dict.fromkeys(reasons))
+    value_features = action_value_features(
+        "ability",
+        kind,
+        attacker,
+        defender,
+        plan or {},
+        {
+            "element": str(effective.get("element", "")),
+            "damage": damage,
+            "accuracy": accuracy,
+            "utility": utility,
+            "incoming_ratio": incoming / max(1.0, float(max_hp(attacker))),
+            "element_multiplier": element_multiplier(str(effective.get("element", "")), defender),
+            "lethal": damage >= defender_hp > 0,
+            "near_lethal": damage >= defender_hp * 0.92 > 0 and is_damage_ability(effective),
+            "reason_tags": list(dict.fromkeys(reasons)),
+            "risk_ratio": incoming / max(1.0, float(self_hp)),
+            "has_dot": kind in {"Bleed", "Poison", "Dot", "Disease", "SwitchCurse"} or has_dangerous_dot(defender),
+            "has_buff": kind in {"Buff", "Bot", "Negate", "Block", "Ethereal"},
+            "has_debuff": kind in CONTROL_TYPES or kind in SOFT_CONTROL_TYPES,
+        },
+    )
+    value_model = action_value_estimate(value_features)
+    value_adjustment = float(value_model.get("adjustment", 0.0) or 0.0)
+    score += value_adjustment
 
     return {
         "id": int(ability.get("id", 0) or 0),
@@ -867,7 +893,76 @@ def score_ability(ability: dict[str, Any], attacker: dict[str, Any], defender: d
         "win_plan": (plan or {}).get("mode", "even"),
         "reason": reason,
         "reason_tags": list(dict.fromkeys(reasons)),
+        "expected_value": value_model.get("expected_value", 0.0),
+        "expected_value_adjustment": round(value_adjustment, 3),
+        "expected_value_confidence": value_model.get("confidence", 0.0),
     }
+
+
+def action_value_features(
+    kind: str,
+    action_type: str,
+    attacker: dict[str, Any],
+    defender: dict[str, Any],
+    plan: dict[str, Any],
+    metrics: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    metrics = metrics or {}
+    player_hp_ratio = float(plan.get("player_hp_ratio", hp_ratio(attacker)) or 0.0)
+    foe_hp_ratio = float(plan.get("foe_hp_ratio", hp_ratio(defender)) or 0.0)
+    player_alive = float(plan.get("player_alive", 1) or 1)
+    foe_alive = float(plan.get("foe_alive", 1) or 1)
+    damage = max(0.0, float(metrics.get("damage", 0.0) or 0.0))
+    defender_max = max(1.0, float(max_hp(defender)))
+    features = {
+        "kind": kind,
+        "action_type": action_type,
+        "reason_tags": metrics.get("reason_tags", []),
+        "win_plan": str(plan.get("mode", "") or ""),
+        "active_element": primary_element(attacker),
+        "foe_element": primary_element(defender),
+        "element": str(metrics.get("element", "") or ""),
+        "turn_bucket": turn_bucket_label(int(plan.get("turns", 0) or 0)),
+        "player_hp_ratio": player_hp_ratio,
+        "foe_hp_ratio": foe_hp_ratio,
+        "hp_advantage": float(plan.get("hp_advantage", player_hp_ratio - foe_hp_ratio) or 0.0),
+        "player_alive": player_alive / 4.0,
+        "foe_alive": foe_alive / 4.0,
+        "alive_advantage": float(plan.get("roster_advantage", player_alive - foe_alive) or 0.0) / 4.0,
+        "last_ally": bool(plan.get("last_ally", player_alive <= 1)),
+        "last_foe": bool(plan.get("last_foe", foe_alive <= 1)),
+        "lethal": bool(metrics.get("lethal", False)),
+        "near_lethal": bool(metrics.get("near_lethal", False)),
+        "damage_ratio": clamp(damage / defender_max, 0.0, 1.5),
+        "incoming_ratio": clamp(float(metrics.get("incoming_ratio", 0.0) or 0.0), 0.0, 2.0),
+        "utility": clamp(float(metrics.get("utility", 0.0) or 0.0) / 80.0, -2.0, 2.0),
+        "candidate_rank": clamp(float(metrics.get("candidate_rank", 0.0) or 0.0) / 6.0, 0.0, 1.0),
+        "chosen_probability": clamp(float(metrics.get("chosen_probability", 1.0) or 1.0), 0.0, 1.0),
+        "advantage": clamp(float(plan.get("hp_advantage", player_hp_ratio - foe_hp_ratio) or 0.0) + float(plan.get("roster_advantage", 0) or 0) * 0.25, -2.0, 2.0),
+        "element_multiplier": float(metrics.get("element_multiplier", 1.0) or 1.0),
+        "incoming_element_multiplier": float(metrics.get("incoming_element_multiplier", 1.0) or 1.0),
+        "outgoing_element_multiplier": float(metrics.get("outgoing_element_multiplier", 1.0) or 1.0),
+        "risk_ratio": clamp(float(metrics.get("risk_ratio", 0.0) or 0.0), 0.0, 3.0),
+        "has_dot": bool(metrics.get("has_dot", False) or has_dangerous_dot(attacker) or has_dangerous_dot(defender)),
+        "has_buff": bool(metrics.get("has_buff", False) or has_any_effect(attacker, ["buff", "bot", "block", "negate"])),
+        "has_debuff": bool(metrics.get("has_debuff", False) or has_any_effect(defender, ["sleep", "confuse", "stun", "slow"])),
+    }
+    return features
+
+
+def turn_bucket_label(turn: int) -> str:
+    if turn <= 1:
+        return "early"
+    if turn <= 4:
+        return "mid"
+    if turn <= 8:
+        return "late"
+    return "deep"
+
+
+def primary_element(miscrit: dict[str, Any]) -> str:
+    elements = miscrit_elements(miscrit)
+    return elements[0] if elements else str(miscrit.get("element", "") or "")
 
 
 def win_condition_adjustment(
@@ -1995,7 +2090,7 @@ def estimated_dot_pressure(kind: str, ap: float, turns: float, times: float) -> 
     return base * max(1.0, float(turns or 1.0))
 
 
-def switch_evaluation(candidate: dict[str, Any], foe: dict[str, Any]) -> dict[str, Any]:
+def switch_evaluation(candidate: dict[str, Any], foe: dict[str, Any], plan: dict[str, Any] | None = None) -> dict[str, Any]:
     if not candidate:
         return {"id": 0, "score": -999.0, "reason": "no_candidate"}
     score = miscrit_power(candidate) * 0.28
@@ -2041,6 +2136,26 @@ def switch_evaluation(candidate: dict[str, Any], foe: dict[str, Any]) -> dict[st
         if reason == "better_matchup":
             reason = "low_hp_switch"
     score += learned_bonus("switch", int(candidate.get("id", 0) or 0), candidate, foe, "switch")
+    value_features = action_value_features(
+        "switch",
+        "switch",
+        candidate,
+        foe,
+        plan or {},
+        {
+            "reason_tags": ["switch", reason],
+            "damage": best_damage,
+            "incoming_ratio": incoming / max(1.0, float(max_hp(candidate))),
+            "risk_ratio": incoming / max(1.0, float(current_hp(candidate))),
+            "incoming_element_multiplier": incoming_element_multiplier,
+            "outgoing_element_multiplier": outgoing_element_multiplier,
+            "element_multiplier": outgoing_element_multiplier,
+            "has_dot": has_dangerous_dot(candidate),
+        },
+    )
+    value_model = action_value_estimate(value_features)
+    value_adjustment = float(value_model.get("adjustment", 0.0) or 0.0)
+    score += value_adjustment
     return {
         "id": int(candidate.get("id", 0) or 0),
         "mid": normalized_mid(candidate),
@@ -2059,6 +2174,9 @@ def switch_evaluation(candidate: dict[str, Any], foe: dict[str, Any]) -> dict[st
         "has_weakness_cover": has_usable_weakness_cover(candidate),
         "best_damage": round(best_damage, 3),
         "reason": reason,
+        "expected_value": value_model.get("expected_value", 0.0),
+        "expected_value_adjustment": round(value_adjustment, 3),
+        "expected_value_confidence": value_model.get("confidence", 0.0),
     }
 
 

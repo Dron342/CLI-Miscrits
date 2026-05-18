@@ -15,7 +15,7 @@ BATTLE_WEIGHTS_FILE = DATA_DIR / "battle_ai_weights.json"
 BATTLE_LOG_DIR = DATA_DIR / "battle_logs"
 BATTLE_LOG_INDEX_FILE = BATTLE_LOG_DIR / "index.json"
 BATTLE_SCHEMA_FILE = DATA_DIR / "battle_schema.json"
-BATTLE_SCHEMA_VERSION = 4
+BATTLE_SCHEMA_VERSION = 5
 MAX_HISTORY = 0
 MAX_EVENTS_PER_BATTLE = 5000
 MAX_DECISIONS_PER_BATTLE = 1000
@@ -32,6 +32,12 @@ ALLY_KO_PENALTY = 0.7
 TRADE_REWARD_SCALE = 0.65
 MAX_TURN_REWARD = 1.35
 MAX_RETURN = 2.5
+VALUE_MODEL_LEARNING_RATE = 0.028
+VALUE_MODEL_L2 = 0.0006
+VALUE_MODEL_MAX_WEIGHT = 3.5
+VALUE_MODEL_MIN_SAMPLES = 80
+VALUE_MODEL_FULL_CONFIDENCE_SAMPLES = 5000
+VALUE_SCORE_SCALE = 14.0
 DAMAGE_ABILITY_TYPES = {"Attack", "Bleed", "Poison", "Dot", "Disease", "SwitchCurse"}
 TICK_DAMAGE_ACTION_TYPES = {
     "antihealdamage",
@@ -132,6 +138,7 @@ def default_weights() -> dict[str, Any]:
         "opponent_matchups": {},
         "opponent_pair_matchups": {},
         "damage_model": default_damage_model(),
+        "value_model": default_value_model(),
     }
 
 
@@ -143,6 +150,16 @@ def default_damage_model() -> dict[str, Any]:
         "mape": 0.0,
         "global": {"count": 0, "avg": 1.0, "scale": 1.0},
         "buckets": {},
+    }
+
+
+def default_value_model() -> dict[str, Any]:
+    return {
+        "version": 1,
+        "samples": 0,
+        "mae": 0.0,
+        "bias": 0.0,
+        "weights": {},
     }
 
 
@@ -345,6 +362,14 @@ def load_weights() -> dict[str, Any]:
         if not isinstance(damage_model.get("global"), dict):
             damage_model["global"] = {"count": 0, "avg": 1.0, "scale": 1.0}
         base["damage_model"] = damage_model
+    if not isinstance(base.get("value_model"), dict):
+        base["value_model"] = default_value_model()
+    else:
+        value_model = default_value_model()
+        value_model.update(base["value_model"])
+        if not isinstance(value_model.get("weights"), dict):
+            value_model["weights"] = {}
+        base["value_model"] = value_model
     return base
 
 
@@ -401,6 +426,23 @@ def damage_multiplier(features: dict[str, Any]) -> float:
         return clamp(global_scale, 0.35, 2.75)
     adjustment = sum(scale - 1.0 for scale in bucket_scales) / max(2.0, len(bucket_scales) ** 0.5 * 2.0)
     return clamp(global_scale * (1.0 + adjustment), 0.35, 2.75)
+
+
+def action_value_estimate(features: dict[str, Any]) -> dict[str, Any]:
+    weights = load_weights()
+    model = weights.get("value_model", {}) if isinstance(weights.get("value_model"), dict) else {}
+    samples = int(model.get("samples", 0) or 0)
+    value = predict_value(model, features)
+    confidence = clamp(samples / float(VALUE_MODEL_FULL_CONFIDENCE_SAMPLES), 0.0, 1.0)
+    if samples < VALUE_MODEL_MIN_SAMPLES:
+        return {"expected_value": 0.0, "adjustment": 0.0, "confidence": confidence, "samples": samples}
+    adjustment = clamp(value, -MAX_RETURN, MAX_RETURN) * VALUE_SCORE_SCALE * confidence
+    return {
+        "expected_value": round(value, 5),
+        "adjustment": round(adjustment, 3),
+        "confidence": round(confidence, 4),
+        "samples": samples,
+    }
 
 
 def record_battle(history_entry: dict[str, Any]) -> None:
@@ -681,6 +723,9 @@ def ai_dashboard() -> dict[str, Any]:
             "player_learning_buckets": sum(len(weights.get(key, {})) for key in ("actions", "reasons", "matchups", "pair_matchups")),
             "opponent_learning_buckets": sum(len(weights.get(key, {})) for key in ("opponent_actions", "opponent_matchups", "opponent_pair_matchups")),
             "damage_buckets": len(weights.get("damage_model", {}).get("buckets", {})) if isinstance(weights.get("damage_model"), dict) else 0,
+            "value_model_samples": int(weights.get("value_model", {}).get("samples", 0) or 0) if isinstance(weights.get("value_model"), dict) else 0,
+            "value_model_mae": float(weights.get("value_model", {}).get("mae", 0.0) or 0.0) if isinstance(weights.get("value_model"), dict) else 0.0,
+            "value_model_features": len(weights.get("value_model", {}).get("weights", {})) if isinstance(weights.get("value_model"), dict) and isinstance(weights.get("value_model", {}).get("weights"), dict) else 0,
         },
     }
 
@@ -960,6 +1005,9 @@ def annotate_decision_rewards(entry: dict[str, Any]) -> None:
         value = float(row.get("turn_reward", 0.0) or 0.0) + RETURN_DISCOUNT * future_return
         future_return = clamp(value, -MAX_RETURN, MAX_RETURN)
         row["return_from_here"] = round(future_return, 5)
+    for row in applied:
+        row["value_features"] = decision_value_features(row)
+        row["expected_value_target"] = round(float(row.get("return_from_here", 0.0) or 0.0), 5)
 
 
 def terminal_reward(entry: dict[str, Any]) -> float:
@@ -1046,6 +1094,143 @@ def snapshot_stats(snapshot: dict[str, Any], side: str, fallback_hp: dict[str, A
     return {"alive": 0, "dead": 0, "hp_ratio": 0.0}
 
 
+def decision_value_features(row: dict[str, Any]) -> dict[str, Any]:
+    decision = row.get("decision", {}) if isinstance(row.get("decision"), dict) else {}
+    hp = row.get("hp", {}) if isinstance(row.get("hp"), dict) else {}
+    player = snapshot_stats(row.get("state_before", {}), "player", hp)
+    foe = snapshot_stats(row.get("state_before", {}), "foe", hp)
+    active = row.get("active", {}) if isinstance(row.get("active"), dict) else {}
+    target = row.get("foe", {}) if isinstance(row.get("foe"), dict) else {}
+    foe_max_hp = max(1.0, float(target.get("max_hp", target.get("hp", 1)) or 1))
+    damage = max(0.0, float(decision.get("damage", 0.0) or 0.0))
+    features = {
+        "kind": str(decision.get("type", row.get("action_type", "none")) or "none"),
+        "action_type": decision_action_type(row) or str(decision.get("type", "none") or "none"),
+        "reason_tags": reason_tags(decision.get("reason_tags", decision.get("reason", ""))),
+        "win_plan": str(decision.get("win_plan", "") or ""),
+        "active_element": str(active.get("element", "") or ""),
+        "foe_element": str(target.get("element", "") or ""),
+        "element": str(decision.get("element", "") or ""),
+        "turn_bucket": turn_bucket(row.get("turns", 0)),
+        "player_hp_ratio": float(player.get("hp_ratio", 0.0) or 0.0),
+        "foe_hp_ratio": float(foe.get("hp_ratio", 0.0) or 0.0),
+        "hp_advantage": float(player.get("hp_ratio", 0.0) or 0.0) - float(foe.get("hp_ratio", 0.0) or 0.0),
+        "player_alive": float(player.get("alive", 0) or 0) / 4.0,
+        "foe_alive": float(foe.get("alive", 0) or 0) / 4.0,
+        "alive_advantage": (float(player.get("alive", 0) or 0) - float(foe.get("alive", 0) or 0)) / 4.0,
+        "last_ally": int(player.get("alive", 0) or 0) <= 1,
+        "last_foe": int(foe.get("alive", 0) or 0) <= 1,
+        "lethal": bool(decision.get("lethal", False)),
+        "near_lethal": bool(decision.get("near_lethal", False)),
+        "damage_ratio": clamp(damage / foe_max_hp, 0.0, 1.5),
+        "incoming_ratio": clamp(float(decision.get("incoming_ratio", 0.0) or 0.0), 0.0, 2.0),
+        "utility": clamp(float(decision.get("utility", 0.0) or 0.0) / 80.0, -2.0, 2.0),
+        "candidate_rank": min(6.0, float(row.get("candidate_rank", decision.get("candidate_rank", 0)) or 0.0)) / 6.0,
+        "chosen_probability": clamp(float(row.get("chosen_probability", decision.get("chosen_probability", 1.0)) or 0.0), 0.0, 1.0),
+        "advantage": clamp(float(row.get("advantage", 0.0) or 0.0), -2.0, 2.0),
+    }
+    return compact_value_features(features)
+
+
+def compact_value_features(features: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in features.items() if value not in ("", [], None)}
+
+
+def turn_bucket(value: Any) -> str:
+    turn = int(value or 0)
+    if turn <= 1:
+        return "early"
+    if turn <= 4:
+        return "mid"
+    if turn <= 8:
+        return "late"
+    return "deep"
+
+
+def value_feature_vector(features: dict[str, Any]) -> dict[str, float]:
+    if not isinstance(features, dict):
+        return {}
+    vector: dict[str, float] = {}
+    for key in (
+        "kind",
+        "action_type",
+        "win_plan",
+        "active_element",
+        "foe_element",
+        "element",
+        "turn_bucket",
+    ):
+        value = str(features.get(key, "") or "").strip()
+        if value:
+            vector[f"{key}:{value}"] = 1.0
+    active_element = str(features.get("active_element", "") or "")
+    foe_element = str(features.get("foe_element", "") or "")
+    if active_element and foe_element:
+        vector[f"element_pair:{active_element}>{foe_element}"] = 1.0
+    for tag in reason_tags(features.get("reason_tags", [])):
+        vector[f"reason:{tag}"] = 1.0
+    for key in (
+        "player_hp_ratio",
+        "foe_hp_ratio",
+        "hp_advantage",
+        "player_alive",
+        "foe_alive",
+        "alive_advantage",
+        "damage_ratio",
+        "incoming_ratio",
+        "utility",
+        "candidate_rank",
+        "chosen_probability",
+        "advantage",
+        "element_multiplier",
+        "incoming_element_multiplier",
+        "outgoing_element_multiplier",
+        "risk_ratio",
+    ):
+        if key in features:
+            value = optional_float(features.get(key))
+            if value is not None:
+                vector[key] = clamp(value, -3.0, 3.0)
+    for key in ("last_ally", "last_foe", "lethal", "near_lethal", "has_dot", "has_buff", "has_debuff"):
+        if bool(features.get(key, False)):
+            vector[key] = 1.0
+    return vector
+
+
+def predict_value(model: dict[str, Any], features: dict[str, Any]) -> float:
+    weights = model.get("weights", {}) if isinstance(model.get("weights"), dict) else {}
+    value = float(model.get("bias", 0.0) or 0.0)
+    for key, feature_value in value_feature_vector(features).items():
+        value += float(weights.get(key, 0.0) or 0.0) * feature_value
+    return clamp(value, -MAX_RETURN, MAX_RETURN)
+
+
+def update_value_model(weights: dict[str, Any], row: dict[str, Any], target: float) -> bool:
+    model = weights.get("value_model")
+    if not isinstance(model, dict):
+        model = default_value_model()
+        weights["value_model"] = model
+    model_weights = model.setdefault("weights", {})
+    if not isinstance(model_weights, dict):
+        model_weights = {}
+        model["weights"] = model_weights
+    features = row.get("value_features", {}) if isinstance(row.get("value_features"), dict) else decision_value_features(row)
+    target = clamp(float(target or 0.0), -MAX_RETURN, MAX_RETURN)
+    prediction = predict_value(model, features)
+    error = clamp(target - prediction, -MAX_RETURN, MAX_RETURN)
+    count = int(model.get("samples", 0) or 0) + 1
+    lr = VALUE_MODEL_LEARNING_RATE / (1.0 + min(2.0, count / 2500.0))
+    model["bias"] = round(clamp(float(model.get("bias", 0.0) or 0.0) + lr * error, -MAX_RETURN, MAX_RETURN), 6)
+    for key, feature_value in value_feature_vector(features).items():
+        old = float(model_weights.get(key, 0.0) or 0.0)
+        updated = old + lr * error * feature_value - VALUE_MODEL_L2 * old
+        model_weights[key] = round(clamp(updated, -VALUE_MODEL_MAX_WEIGHT, VALUE_MODEL_MAX_WEIGHT), 6)
+    old_mae = float(model.get("mae", 0.0) or 0.0)
+    model["samples"] = count
+    model["mae"] = round(rolling_average(old_mae, abs(error), count), 6)
+    return True
+
+
 def apply_battle_to_weights(weights: dict[str, Any], entry: dict[str, Any]) -> bool:
     changed = update_damage_model(weights, entry.get("damage_samples", []))
     applied_updates = 0
@@ -1056,7 +1241,9 @@ def apply_battle_to_weights(weights: dict[str, Any], entry: dict[str, Any]) -> b
         if not isinstance(decision, dict):
             continue
         reward = float(row.get("return_from_here", row.get("turn_reward", 0.0)) or 0.0)
+        update_value_model(weights, row, reward)
         if abs(reward) < 0.01:
+            applied_updates += 1
             continue
         kind = str(decision.get("type", "none"))
         action_id = int(decision.get("id", 0) or 0)
@@ -1653,9 +1840,14 @@ def clean_decision(decision: dict[str, Any]) -> dict[str, Any]:
         "candidate_rank": int(decision.get("candidate_rank", debug.get("candidate_rank", candidate_rank(candidates, decision.get("id", 0)))) or 0),
         "score": debug.get("score"),
         "damage": debug.get("damage"),
+        "accuracy": debug.get("accuracy"),
+        "element": debug.get("element", ""),
         "utility": debug.get("utility"),
         "lethal": debug.get("lethal"),
         "near_lethal": debug.get("near_lethal"),
+        "expected_value": debug.get("expected_value"),
+        "expected_value_adjustment": debug.get("expected_value_adjustment"),
+        "expected_value_confidence": debug.get("expected_value_confidence"),
         "redundant": debug.get("redundant"),
         "immune_blocked": debug.get("immune_blocked"),
         "gain": debug.get("gain"),
