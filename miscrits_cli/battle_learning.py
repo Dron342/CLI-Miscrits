@@ -15,7 +15,7 @@ BATTLE_WEIGHTS_FILE = DATA_DIR / "battle_ai_weights.json"
 BATTLE_LOG_DIR = DATA_DIR / "battle_logs"
 BATTLE_LOG_INDEX_FILE = BATTLE_LOG_DIR / "index.json"
 BATTLE_SCHEMA_FILE = DATA_DIR / "battle_schema.json"
-BATTLE_SCHEMA_VERSION = 7
+BATTLE_SCHEMA_VERSION = 9
 MAX_HISTORY = 0
 MAX_EVENTS_PER_BATTLE = 5000
 MAX_DECISIONS_PER_BATTLE = 1000
@@ -1171,7 +1171,6 @@ def decision_value_features(row: dict[str, Any]) -> dict[str, Any]:
         "incoming_ratio": clamp(float(decision.get("incoming_ratio", 0.0) or 0.0), 0.0, 2.0),
         "utility": clamp(float(decision.get("utility", 0.0) or 0.0) / 80.0, -2.0, 2.0),
         "candidate_rank": min(6.0, float(row.get("candidate_rank", decision.get("candidate_rank", 0)) or 0.0)) / 6.0,
-        "chosen_probability": clamp(float(row.get("chosen_probability", decision.get("chosen_probability", 1.0)) or 0.0), 0.0, 1.0),
         "advantage": clamp(float(row.get("advantage", 0.0) or 0.0), -2.0, 2.0),
     }
     return compact_value_features(features)
@@ -1195,8 +1194,7 @@ def annotate_candidate_set(row: dict[str, Any]) -> None:
         candidate["observed"] = bool(is_chosen)
         if is_chosen:
             candidate["observed_return"] = round(observed_return, 5)
-        if not isinstance(candidate.get("value_features"), dict):
-            candidate["value_features"] = candidate_value_features(row, candidate)
+        candidate["value_features"] = candidate_value_features(row, candidate)
         candidate["relative_label"] = candidate_relative_label(is_chosen, observed_return)
 
 
@@ -1243,7 +1241,6 @@ def candidate_value_features(row: dict[str, Any], candidate: dict[str, Any]) -> 
             "incoming_ratio": clamp(float(candidate.get("incoming_ratio", base.get("incoming_ratio", 0.0)) or 0.0), 0.0, 2.0),
             "utility": clamp(float(candidate.get("utility", 0.0) or 0.0) / 80.0, -2.0, 2.0),
             "candidate_rank": min(24.0, float(candidate.get("candidate_rank", 0) or 0.0)) / 24.0,
-            "chosen_probability": 0.0,
             "element_multiplier": float(candidate.get("element_multiplier", base.get("element_multiplier", 1.0)) or 1.0),
             "incoming_element_multiplier": float(candidate.get("incoming_element_multiplier", base.get("incoming_element_multiplier", 1.0)) or 1.0),
             "outgoing_element_multiplier": float(candidate.get("outgoing_element_multiplier", base.get("outgoing_element_multiplier", 1.0)) or 1.0),
@@ -1253,8 +1250,6 @@ def candidate_value_features(row: dict[str, Any], candidate: dict[str, Any]) -> 
     foe = row.get("foe", {}) if isinstance(row.get("foe"), dict) else {}
     foe_max_hp = max(1.0, float(foe.get("max_hp", foe.get("hp", 1)) or 1))
     base["damage_ratio"] = clamp(damage / foe_max_hp, 0.0, 1.5)
-    if candidate.get("chosen"):
-        base["chosen_probability"] = clamp(float(row.get("chosen_probability", decision.get("chosen_probability", 1.0)) or 0.0), 0.0, 1.0)
     return compact_value_features(base)
 
 
@@ -1306,7 +1301,6 @@ def value_feature_vector(features: dict[str, Any]) -> dict[str, float]:
         "incoming_ratio",
         "utility",
         "candidate_rank",
-        "chosen_probability",
         "advantage",
         "element_multiplier",
         "incoming_element_multiplier",
