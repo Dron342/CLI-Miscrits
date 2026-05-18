@@ -76,6 +76,13 @@ python -m miscrits_cli rpc update_location --payload "{\"locationId\":1,\"areaId
 - Confidence моделей теперь считается по уникальным решениям и парам кандидатов, а не по повторным replay-проходам.
 - Обновлена версия приложения до `0.3.5`.
 
+## Изменения в 0.3.6
+
+- Исправлена блокировка автообновления `not_git_checkout` для копий CLI, запущенных не из Git-checkout.
+- Если рядом с установленным CLI нет `.git`, обновление скачивает архив опубликованного GitHub-тега и обновляет пакетные файлы на месте.
+- Для Git-checkout поведение осталось прежним: используется только чистый fast-forward через git.
+- Обновлена версия приложения до `0.3.6`.
+
 ## Breeding
 
 The S+ breeding planner uses only level 1 miscrits, skips team members and favorites, and avoids spending unique S+ copies unless explicitly allowed.
