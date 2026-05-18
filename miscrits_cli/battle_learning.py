@@ -14,6 +14,8 @@ BATTLE_HISTORY_FILE = DATA_DIR / "battle_history.json"
 BATTLE_WEIGHTS_FILE = DATA_DIR / "battle_ai_weights.json"
 BATTLE_LOG_DIR = DATA_DIR / "battle_logs"
 BATTLE_LOG_INDEX_FILE = BATTLE_LOG_DIR / "index.json"
+BATTLE_SCHEMA_FILE = DATA_DIR / "battle_schema.json"
+BATTLE_SCHEMA_VERSION = 4
 MAX_HISTORY = 0
 MAX_EVENTS_PER_BATTLE = 5000
 MAX_DECISIONS_PER_BATTLE = 1000
@@ -23,7 +25,98 @@ MAX_WEIGHT = 24.0
 DAMAGE_LEARNING_RATE = 0.06
 IMITATION_LEARNING_RATE = 0.045
 IMITATION_MAX_REWARD = 0.75
+RETURN_DISCOUNT = 0.92
+DIRECT_DAMAGE_REWARD_SCALE = 0.9
+ENEMY_KO_REWARD = 0.45
+ALLY_KO_PENALTY = 0.7
+TRADE_REWARD_SCALE = 0.65
+MAX_TURN_REWARD = 1.35
+MAX_RETURN = 2.5
 DAMAGE_ABILITY_TYPES = {"Attack", "Bleed", "Poison", "Dot", "Disease", "SwitchCurse"}
+TICK_DAMAGE_ACTION_TYPES = {
+    "antihealdamage",
+    "barbed",
+    "barbeddamage",
+    "bleed",
+    "bleeddamage",
+    "disease",
+    "diseasedamage",
+    "dotdamage",
+    "hotantiheal",
+    "hotdamage",
+    "poison",
+    "poisondamage",
+    "switchcurse",
+    "switchcursedamage",
+    "timebombdamage",
+}
+KNOWN_REASON_TAGS = {
+    "active_dead",
+    "ahead_avoid_low_accuracy",
+    "ahead_avoid_unneeded_status",
+    "ahead_preserve_hp",
+    "ahead_safe_damage",
+    "antiheal_risk",
+    "attack_followup",
+    "avoid_setup_last_foe",
+    "avoid_slow_status_last_foe",
+    "behind_confuse_pressure",
+    "behind_crit_out",
+    "behind_dot_pressure",
+    "behind_high_damage_risk",
+    "behind_setup_needs_window",
+    "behind_sleep_window",
+    "behind_switch_lock",
+    "best_available_attack",
+    "best_scored_ability",
+    "better_matchup",
+    "cleanse_dot",
+    "damage_pressure",
+    "escape_bad_element",
+    "escape_hard_counter",
+    "explore",
+    "fallback",
+    "finish_last_foe",
+    "force_switch",
+    "forced_attack_after_utility",
+    "highest_expected_damage",
+    "highest_utility",
+    "immune_blocked",
+    "incoming_lethal",
+    "kill_pressure",
+    "last_ally_avoid_slow_dot",
+    "last_ally_damage_now",
+    "last_ally_no_long_buff",
+    "last_ally_no_time",
+    "last_ally_soft_control",
+    "last_ally_survival",
+    "lethal",
+    "lethal_finish",
+    "lookahead_enemy_kills",
+    "lookahead_expected_ko",
+    "lookahead_last_ally_risk",
+    "lookahead_next_finish",
+    "lookahead_next_pressure",
+    "lookahead_safe",
+    "lookahead_trade_risk",
+    "low_hp_switch",
+    "near_lethal",
+    "near_lethal_pressure",
+    "no_action_available",
+    "no_active_miscrit",
+    "no_alive_bench",
+    "no_usable_ability",
+    "opponent_predict",
+    "recovery_saves_life",
+    "recovery_too_small",
+    "recovery_value",
+    "redundant_status",
+    "secure_final_kill",
+    "switch",
+    "unsafe_switch",
+    "wakes_sleep",
+}
+_SCHEMA_READY = False
 
 
 def default_weights() -> dict[str, Any]:
@@ -53,7 +146,187 @@ def default_damage_model() -> dict[str, Any]:
     }
 
 
+def ensure_battle_data_schema() -> None:
+    global _SCHEMA_READY
+    if _SCHEMA_READY:
+        return
+    schema = load_json(BATTLE_SCHEMA_FILE, {})
+    if isinstance(schema, dict) and int(schema.get("version", 0) or 0) >= BATTLE_SCHEMA_VERSION:
+        _SCHEMA_READY = True
+        return
+    history = load_json(BATTLE_HISTORY_FILE, [])
+    if not isinstance(history, list):
+        history = []
+    migrated = [migrate_battle_entry(item) for item in history if isinstance(item, dict)]
+    save_json(BATTLE_HISTORY_FILE, migrated)
+    rebuild_battle_log_files(migrated)
+    rebuild_weights_from_history(migrated)
+    save_json(
+        BATTLE_SCHEMA_FILE,
+        {
+            "version": BATTLE_SCHEMA_VERSION,
+            "migrated_at": time.time(),
+            "history_count": len(migrated),
+        },
+    )
+    _SCHEMA_READY = True
+
+
+def rebuild_battle_log_files(history: list[dict[str, Any]]) -> None:
+    index: list[dict[str, Any]] = []
+    for entry in history:
+        battle_id = safe_battle_id(str(entry.get("id", "") or ""))
+        if not battle_id:
+            continue
+        log_file = BATTLE_LOG_DIR / f"{battle_id}.json"
+        save_json(log_file, entry)
+        summary = battle_log_summary(entry)
+        summary["file"] = str(log_file)
+        index.append(summary)
+    index.sort(key=lambda item: float(item.get("finished_at", item.get("started_at", 0)) or 0))
+    save_json(BATTLE_LOG_INDEX_FILE, index)
+
+
+def rebuild_weights_from_history(history: list[dict[str, Any]]) -> None:
+    weights = default_weights()
+    for entry in history:
+        apply_battle_to_weights(weights, entry)
+    save_weights(weights)
+
+
+def migrate_battle_entry(entry: dict[str, Any]) -> dict[str, Any]:
+    migrated = dict(entry)
+    migrated["schema_version"] = BATTLE_SCHEMA_VERSION
+    events = migrated.get("events", []) if isinstance(migrated.get("events"), list) else []
+    decisions = migrated.get("decisions", []) if isinstance(migrated.get("decisions"), list) else []
+    for row in decisions:
+        if not isinstance(row, dict):
+            continue
+        migrate_decision_row(row, events)
+    damage_samples = migrated.get("damage_samples", []) if isinstance(migrated.get("damage_samples"), list) else []
+    for sample in damage_samples:
+        if isinstance(sample, dict):
+            migrate_damage_sample(sample)
+    outcome = str(migrated.get("outcome", "") or "unknown")
+    if outcome not in {"victory", "defeat"}:
+        inferred = infer_snapshot_outcome(migrated.get("finish", {}))
+        if inferred:
+            migrated["outcome"] = inferred
+            migrated["outcome_source"] = "migrated_snapshot"
+            migrated["outcome_confidence"] = 0.95
+            turns = int(migrated.get("turns_executed", migrated.get("turns_sent", 0)) or 0)
+            migrated["grade"] = grade_battle(inferred, migrated.get("start", {}), migrated.get("finish", {}), turns)
+        else:
+            migrated.setdefault("outcome_source", "legacy_unknown")
+            migrated.setdefault("outcome_confidence", 0.0)
+    else:
+        migrated.setdefault("outcome_source", "legacy_outcome")
+        migrated.setdefault("outcome_confidence", 0.7)
+    annotate_decision_rewards(migrated)
+    migrated["post_battle"] = post_battle_analysis(migrated)
+    return migrated
+
+
+def migrate_decision_row(row: dict[str, Any], events: list[dict[str, Any]]) -> None:
+    decision = row.get("decision", {}) if isinstance(row.get("decision"), dict) else {}
+    candidates = decision.get("candidates", []) if isinstance(decision.get("candidates"), list) else []
+    decision.setdefault("reason_tags", reason_tags(decision.get("reason", "")))
+    decision.setdefault("action_type", decision.get("type", ""))
+    decision.setdefault("chosen_probability", 1.0)
+    decision.setdefault("candidate_rank", candidate_rank(candidates, decision.get("id", 0)))
+    row.setdefault("action_type", decision.get("action_type", decision.get("type", "")))
+    row.setdefault("chosen_probability", decision.get("chosen_probability", 1.0))
+    row.setdefault("candidate_rank", decision.get("candidate_rank", 0))
+    if not isinstance(row.get("state_before"), dict) or not row.get("state_before"):
+        row["state_before"] = {
+            "legacy_partial": True,
+            "turns": row.get("turns", 0),
+            "active": row.get("active", {}),
+            "foe": row.get("foe", {}),
+            "hp": row.get("hp", {}),
+        }
+    if not isinstance(row.get("state_after"), dict) or not row.get("state_after"):
+        row["state_after"] = state_after_decision(row, events)
+    row.setdefault("hp_delta_self", 0.0)
+    row.setdefault("hp_delta_enemy", 0.0)
+    row.setdefault("ally_ko", 0)
+    row.setdefault("enemy_ko", 0)
+    row.setdefault("turn_reward", 0.0)
+    row.setdefault("return_from_here", 0.0)
+    row.setdefault("advantage", 0.0)
+
+
+def migrate_damage_sample(sample: dict[str, Any]) -> None:
+    action = sample.get("action", {}) if isinstance(sample.get("action"), dict) else {}
+    action_type = str(sample.get("action_type", action.get("type", "")) or "")
+    sample["action_type"] = action_type
+    sample["damage_kind"] = damage_kind_for_action(action_type)
+    features = sample.get("features", {}) if isinstance(sample.get("features"), dict) else {}
+    features["action_type"] = action_type or "Unknown"
+    features["damage_kind"] = sample["damage_kind"]
+    sample["features"] = features
+
+
+def reason_tags(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return dedupe_tags([str(item).strip() for item in value if str(item).strip()])
+    text = str(value or "").strip()
+    if not text:
+        return []
+    if text in KNOWN_REASON_TAGS:
+        return [text]
+    tokens = text.split("_")
+    known_parts = sorted((tag.split("_") for tag in KNOWN_REASON_TAGS), key=len, reverse=True)
+    tags: list[str] = []
+    index = 0
+    while index < len(tokens):
+        match: list[str] | None = None
+        for parts in known_parts:
+            if tokens[index : index + len(parts)] == parts:
+                match = parts
+                break
+        if match is None:
+            return [f"legacy:{text}"]
+        tags.append("_".join(match))
+        index += len(match)
+    return dedupe_tags(tags)
+
+
+def dedupe_tags(tags: list[str]) -> list[str]:
+    return list(dict.fromkeys(tag for tag in tags if tag))
+
+
+def candidate_rank(candidates: list[Any], action_id: Any) -> int:
+    target = int(action_id or 0)
+    if target and not candidates:
+        return 1
+    for index, item in enumerate(candidates, start=1):
+        if isinstance(item, dict) and int(item.get("id", 0) or 0) == target:
+            return index
+    return 0
+
+
+def damage_kind_for_action(action_type: str) -> str:
+    normalized = str(action_type or "").strip().casefold()
+    if normalized in TICK_DAMAGE_ACTION_TYPES:
+        return "tick"
+    return "direct"
+
+
+def infer_snapshot_outcome(snapshot: Any) -> str:
+    if not isinstance(snapshot, dict):
+        return ""
+    player = side_stats(snapshot, "player")
+    foe = side_stats(snapshot, "foe")
+    if int(player.get("dead", 0) or 0) >= 4 or (player.get("alive") == 0 and player.get("dead", 0) > 0):
+        return "defeat"
+    if int(foe.get("dead", 0) or 0) >= 4 or (foe.get("alive") == 0 and foe.get("dead", 0) > 0):
+        return "victory"
+    return ""
+
+
 def load_weights() -> dict[str, Any]:
+    ensure_battle_data_schema()
     data = load_json(BATTLE_WEIGHTS_FILE, default_weights())
     if not isinstance(data, dict):
         return default_weights()
@@ -80,17 +353,16 @@ def save_weights(weights: dict[str, Any]) -> None:
     save_json(BATTLE_WEIGHTS_FILE, weights)
 
 
-def learned_bonus(kind: str, action_id: int, attacker: dict[str, Any], defender: dict[str, Any], reason: str = "") -> float:
+def learned_bonus(kind: str, action_id: int, attacker: dict[str, Any], defender: dict[str, Any], reason: Any = "") -> float:
     weights = load_weights()
     bonus = 0.0
     action_entry = weights.get("actions", {}).get(action_key(kind, action_id), {})
     if isinstance(action_entry, dict):
         bonus += float(action_entry.get("weight", 0.0) or 0.0)
-    if reason:
-        for part in str(reason).split("_"):
-            reason_entry = weights.get("reasons", {}).get(part, {})
-            if isinstance(reason_entry, dict):
-                bonus += float(reason_entry.get("weight", 0.0) or 0.0) * 0.35
+    for tag in reason_tags(reason):
+        reason_entry = weights.get("reasons", {}).get(tag, {})
+        if isinstance(reason_entry, dict):
+            bonus += float(reason_entry.get("weight", 0.0) or 0.0) * 0.35
     matchup_entry = weights.get("matchups", {}).get(matchup_key(attacker, defender, kind, action_id), {})
     if isinstance(matchup_entry, dict):
         bonus += float(matchup_entry.get("weight", 0.0) or 0.0)
@@ -132,6 +404,7 @@ def damage_multiplier(features: dict[str, Any]) -> float:
 
 
 def record_battle(history_entry: dict[str, Any]) -> None:
+    ensure_battle_data_schema()
     history = load_json(BATTLE_HISTORY_FILE, [])
     if not isinstance(history, list):
         history = []
@@ -143,6 +416,7 @@ def record_battle(history_entry: dict[str, Any]) -> None:
 
 
 def load_battle_history(limit: int | None = 50) -> list[dict[str, Any]]:
+    ensure_battle_data_schema()
     history = load_json(BATTLE_HISTORY_FILE, [])
     if not isinstance(history, list):
         return []
@@ -262,7 +536,7 @@ def battle_timeline(entry: dict[str, Any]) -> list[dict[str, Any]]:
                     "actor": miscrit_label(event.get("active", {})),
                     "target": miscrit_label(event.get("foe", {})),
                     "action": decision_label(decision),
-                    "reason": debug.get("reason", ""),
+                    "reason": debug.get("reason", decision.get("reason", "")),
                     "sent": event.get("sent", False),
                     "hp": event.get("hp", {}),
                 }
@@ -386,10 +660,8 @@ def ai_dashboard() -> dict[str, Any]:
             if not isinstance(row, dict) or not decision_applied(row):
                 continue
             decision = row.get("decision", {}) if isinstance(row.get("decision"), dict) else {}
-            debug = decision.get("debug", {}) if isinstance(decision.get("debug"), dict) else {}
-            reason = str(debug.get("reason", decision.get("reason", "")) or "").strip()
-            if reason:
-                reason_counts[reason] += 1
+            for tag in reason_tags(decision.get("reason_tags", decision.get("reason", ""))):
+                reason_counts[tag] += 1
             kind = str(decision.get("type", "action") or "action")
             action_id = int(decision.get("id", 0) or 0)
             if action_id:
@@ -526,6 +798,7 @@ class BattleRecorder:
             if isinstance(snapshot, dict):
                 row["after_turns"] = snapshot.get("turns", row.get("turns", 0))
                 row["after_hp"] = hp_summary(snapshot)
+                row["state_after"] = compact_snapshot(snapshot)
             self.acknowledged_actions.add(fingerprint)
             self.events.append(
                 {
@@ -554,6 +827,8 @@ class BattleRecorder:
                     "ability": sample.get("ability", {}),
                     "attacker": sample.get("attacker", {}),
                     "defender": sample.get("defender", {}),
+                    "action_type": sample.get("action_type", ""),
+                    "damage_kind": sample.get("damage_kind", "direct"),
                     "expected": sample.get("predicted_damage", 0),
                     "actual": sample.get("actual_damage", 0),
                     "error": sample.get("error", 0),
@@ -565,22 +840,42 @@ class BattleRecorder:
     def record_decision(self, decision: dict[str, Any], sent: bool, snapshot: dict[str, Any]) -> None:
         active = active_miscrit(snapshot, "player")
         foe = active_miscrit(snapshot, "foe")
+        clean = clean_decision(decision)
         row = {
             "timestamp": time.time(),
             "turns": snapshot.get("turns", 0),
             "sent": sent,
             "executed": False,
-            "decision": clean_decision(decision),
+            "decision": clean,
+            "action_type": clean.get("action_type", clean.get("type", "")),
+            "chosen_probability": clean.get("chosen_probability", 1.0),
+            "candidate_rank": clean.get("candidate_rank", 0),
             "active": compact_miscrit(active),
             "foe": compact_miscrit(foe),
             "hp": hp_summary(snapshot),
+            "state_before": compact_snapshot(snapshot),
+            "state_after": {},
+            "hp_delta_self": 0.0,
+            "hp_delta_enemy": 0.0,
+            "ally_ko": 0,
+            "enemy_ko": 0,
+            "turn_reward": 0.0,
+            "return_from_here": 0.0,
+            "advantage": 0.0,
         }
         self.decisions.append(row)
         self.decisions = self.decisions[-MAX_DECISIONS_PER_BATTLE:]
         self.events.append({"timestamp": row["timestamp"], "event": "decision", **row})
         self.events = self.events[-MAX_EVENTS_PER_BATTLE:]
 
-    def finish(self, outcome: str, turns_sent: int, final_snapshot: dict[str, Any]) -> dict[str, Any]:
+    def finish(
+        self,
+        outcome: str,
+        turns_sent: int,
+        final_snapshot: dict[str, Any],
+        outcome_source: str = "",
+        outcome_confidence: float = 0.0,
+    ) -> dict[str, Any]:
         if final_snapshot:
             self.last_snapshot = compact_snapshot(final_snapshot)
         turns_executed = sum(1 for row in self.decisions if decision_applied(row))
@@ -591,7 +886,10 @@ class BattleRecorder:
             "match_id": self.match_id,
             "started_at": self.started_at,
             "finished_at": time.time(),
+            "schema_version": BATTLE_SCHEMA_VERSION,
             "outcome": outcome,
+            "outcome_source": outcome_source or ("server" if outcome in {"victory", "defeat"} else "unknown"),
+            "outcome_confidence": round(float(outcome_confidence), 4),
             "turns_sent": turns_sent,
             "turns_executed": turns_executed,
             "grade": grade,
@@ -601,40 +899,179 @@ class BattleRecorder:
             "damage_samples": self.damage_samples,
             "events": self.events,
         }
+        annotate_decision_rewards(entry)
         entry["post_battle"] = post_battle_analysis(entry)
         record_battle(entry)
-        if outcome in {"victory", "defeat"}:
-            update_weights_from_battle(entry)
+        update_weights_from_battle(entry)
         return grade
 
 
 def update_weights_from_battle(entry: dict[str, Any]) -> None:
-    grade = entry.get("grade", {})
-    reward = float(grade.get("learning_reward", 0.0) or 0.0)
     weights = load_weights()
+    changed = apply_battle_to_weights(weights, entry)
+    if changed:
+        save_weights(weights)
+
+
+def annotate_decision_rewards(entry: dict[str, Any]) -> None:
+    decisions = entry.get("decisions", []) if isinstance(entry.get("decisions"), list) else []
+    applied = [row for row in decisions if isinstance(row, dict) and decision_applied(row)]
+    if not applied:
+        entry["terminal_reward"] = terminal_reward(entry)
+        return
+    damage_samples = entry.get("damage_samples", []) if isinstance(entry.get("damage_samples"), list) else []
+    used_samples: set[int] = set()
+    finish = entry.get("finish", {}) if isinstance(entry.get("finish"), dict) else {}
+    for index, row in enumerate(applied):
+        next_row = applied[index + 1] if index + 1 < len(applied) else {}
+        before = row.get("state_before", {}) if isinstance(row.get("state_before"), dict) else {}
+        own_after = row.get("state_after", {}) if isinstance(row.get("state_after"), dict) else {}
+        if not own_after:
+            own_after = state_after_decision(row, entry.get("events", []))
+        transition_end = next_row.get("state_before", {}) if isinstance(next_row.get("state_before"), dict) else {}
+        if not transition_end:
+            transition_end = finish
+        before_hp = row.get("hp", {}) if isinstance(row.get("hp"), dict) else {}
+        own_after_hp = row.get("after_hp", {}) if isinstance(row.get("after_hp"), dict) else {}
+        next_hp = next_row.get("hp", {}) if isinstance(next_row.get("hp"), dict) else {}
+        hp_delta_enemy = hp_loss_between(before, own_after, "foe", before_hp, own_after_hp)
+        hp_delta_self = hp_loss_between(before, transition_end, "player", before_hp, next_hp)
+        enemy_ko = ko_delta(before, own_after, "foe", before_hp, own_after_hp)
+        ally_ko = ko_delta(before, transition_end, "player", before_hp, next_hp)
+        direct_damage_ratio = direct_damage_ratio_for_decision(row, damage_samples, used_samples)
+        if direct_damage_ratio <= 0.0 and decision_action_type(row).casefold() == "attack":
+            direct_damage_ratio = hp_delta_enemy
+        trade_reward = clamp((hp_delta_enemy - hp_delta_self) * TRADE_REWARD_SCALE, -0.35, 0.35)
+        turn_reward = (
+            direct_damage_ratio * DIRECT_DAMAGE_REWARD_SCALE
+            + enemy_ko * ENEMY_KO_REWARD
+            - ally_ko * ALLY_KO_PENALTY
+            + trade_reward
+        )
+        row["hp_delta_self"] = round(hp_delta_self, 5)
+        row["hp_delta_enemy"] = round(hp_delta_enemy, 5)
+        row["ally_ko"] = int(ally_ko)
+        row["enemy_ko"] = int(enemy_ko)
+        row["turn_reward"] = round(clamp(turn_reward, -MAX_TURN_REWARD, MAX_TURN_REWARD), 5)
+        row["advantage"] = round(state_advantage(transition_end, next_hp), 5)
+    future_return = terminal_reward(entry)
+    entry["terminal_reward"] = round(future_return, 5)
+    for row in reversed(applied):
+        value = float(row.get("turn_reward", 0.0) or 0.0) + RETURN_DISCOUNT * future_return
+        future_return = clamp(value, -MAX_RETURN, MAX_RETURN)
+        row["return_from_here"] = round(future_return, 5)
+
+
+def terminal_reward(entry: dict[str, Any]) -> float:
+    outcome = str(entry.get("outcome", "") or "")
+    if outcome not in {"victory", "defeat"}:
+        return 0.0
+    confidence = float(entry.get("outcome_confidence", 1.0) or 0.0)
+    if confidence <= 0.0:
+        confidence = 1.0
+    return (1.0 if outcome == "victory" else -1.0) * clamp(confidence, 0.0, 1.0)
+
+
+def direct_damage_ratio_for_decision(row: dict[str, Any], samples: list[Any], used_samples: set[int]) -> float:
+    decision = row.get("decision", {}) if isinstance(row.get("decision"), dict) else {}
+    action_id = int(decision.get("id", 0) or 0)
+    if not action_id:
+        return 0.0
+    turn_values = {int(row.get("turns", 0) or 0)}
+    if row.get("after_turns") is not None:
+        turn_values.add(int(row.get("after_turns", 0) or 0))
+    total_ratio = 0.0
+    matched: list[int] = []
+    for index, sample in enumerate(samples):
+        if index in used_samples or not isinstance(sample, dict):
+            continue
+        if str(sample.get("damage_kind", "direct") or "direct") != "direct":
+            continue
+        ability = sample.get("ability", {}) if isinstance(sample.get("ability"), dict) else {}
+        if int(ability.get("id", 0) or 0) != action_id:
+            continue
+        side = str(sample.get("side", "") or "")
+        if side and side != "player":
+            continue
+        sample_turn = int(sample.get("turns", 0) or 0)
+        if sample_turn not in turn_values:
+            continue
+        defender = sample.get("defender", {}) if isinstance(sample.get("defender"), dict) else {}
+        max_hp = max(1.0, float(defender.get("max_hp", defender.get("hp", 1)) or 1))
+        actual = max(0.0, float(sample.get("actual_damage", sample.get("actual", 0.0)) or 0.0))
+        total_ratio += min(1.5, actual / max_hp)
+        matched.append(index)
+    for index in matched:
+        used_samples.add(index)
+    return clamp(total_ratio, 0.0, 1.5)
+
+
+def decision_action_type(row: dict[str, Any]) -> str:
+    decision = row.get("decision", {}) if isinstance(row.get("decision"), dict) else {}
+    return str(row.get("action_type", decision.get("action_type", decision.get("type", ""))) or "")
+
+
+def hp_loss_between(before: dict[str, Any], after: dict[str, Any], side: str, before_hp: dict[str, Any] | None = None, after_hp: dict[str, Any] | None = None) -> float:
+    before_stats = snapshot_stats(before, side, before_hp)
+    after_stats = snapshot_stats(after, side, after_hp)
+    return max(0.0, float(before_stats.get("hp_ratio", 0.0) or 0.0) - float(after_stats.get("hp_ratio", 0.0) or 0.0))
+
+
+def ko_delta(before: dict[str, Any], after: dict[str, Any], side: str, before_hp: dict[str, Any] | None = None, after_hp: dict[str, Any] | None = None) -> int:
+    before_stats = snapshot_stats(before, side, before_hp)
+    after_stats = snapshot_stats(after, side, after_hp)
+    return max(0, int(after_stats.get("dead", 0) or 0) - int(before_stats.get("dead", 0) or 0))
+
+
+def state_advantage(snapshot: dict[str, Any], fallback_hp: dict[str, Any] | None = None) -> float:
+    player = snapshot_stats(snapshot, "player", fallback_hp)
+    foe = snapshot_stats(snapshot, "foe", fallback_hp)
+    hp_gap = float(player.get("hp_ratio", 0.0) or 0.0) - float(foe.get("hp_ratio", 0.0) or 0.0)
+    alive_gap = int(player.get("alive", 0) or 0) - int(foe.get("alive", 0) or 0)
+    return clamp(hp_gap + alive_gap * 0.25, -2.0, 2.0)
+
+
+def snapshot_stats(snapshot: dict[str, Any], side: str, fallback_hp: dict[str, Any] | None = None) -> dict[str, Any]:
+    if isinstance(snapshot, dict):
+        hp = snapshot.get("hp", {}) if isinstance(snapshot.get("hp"), dict) else {}
+        stats = hp.get(side, {}) if isinstance(hp.get(side), dict) else {}
+        if stats:
+            return stats
+        if isinstance(snapshot.get(side), dict):
+            return side_stats(snapshot, side)
+    fallback = fallback_hp or {}
+    stats = fallback.get(side, {}) if isinstance(fallback, dict) and isinstance(fallback.get(side), dict) else {}
+    if stats:
+        return stats
+    return {"alive": 0, "dead": 0, "hp_ratio": 0.0}
+
+
+def apply_battle_to_weights(weights: dict[str, Any], entry: dict[str, Any]) -> bool:
     changed = update_damage_model(weights, entry.get("damage_samples", []))
-    if abs(reward) >= 0.01:
+    applied_updates = 0
+    for row in entry.get("decisions", []):
+        if not isinstance(row, dict) or not decision_applied(row):
+            continue
+        decision = row.get("decision", {})
+        if not isinstance(decision, dict):
+            continue
+        reward = float(row.get("return_from_here", row.get("turn_reward", 0.0)) or 0.0)
+        if abs(reward) < 0.01:
+            continue
+        kind = str(decision.get("type", "none"))
+        action_id = int(decision.get("id", 0) or 0)
+        update_bucket(weights["actions"], action_key(kind, action_id), reward)
+        for tag in reason_tags(decision.get("reason_tags", decision.get("reason", ""))):
+            update_bucket(weights["reasons"], tag, reward * 0.55)
+        update_bucket(weights["matchups"], matchup_key(row.get("active", {}), row.get("foe", {}), kind, action_id), reward * 0.75)
+        update_bucket(weights["pair_matchups"], pair_matchup_key(row.get("active", {}), row.get("foe", {})), reward * 0.9)
+        applied_updates += 1
+    if applied_updates:
         weights["battles"] = int(weights.get("battles", 0) or 0) + 1
-        for row in entry.get("decisions", []):
-            if not isinstance(row, dict) or not decision_applied(row):
-                continue
-            decision = row.get("decision", {})
-            if not isinstance(decision, dict):
-                continue
-            kind = str(decision.get("type", "none"))
-            action_id = int(decision.get("id", 0) or 0)
-            reason = str(decision.get("reason", ""))
-            update_bucket(weights["actions"], action_key(kind, action_id), reward)
-            for part in reason.split("_"):
-                if part:
-                    update_bucket(weights["reasons"], part, reward * 0.55)
-            update_bucket(weights["matchups"], matchup_key(row.get("active", {}), row.get("foe", {}), kind, action_id), reward * 0.75)
-            update_bucket(weights["pair_matchups"], pair_matchup_key(row.get("active", {}), row.get("foe", {})), reward * 0.9)
         changed = True
     if str(entry.get("outcome", "")) == "defeat":
         changed = update_opponent_imitation(weights, entry.get("damage_samples", [])) or changed
-    if changed:
-        save_weights(weights)
+    return changed
 
 
 def update_opponent_imitation(weights: dict[str, Any], samples: Any) -> bool:
@@ -853,6 +1290,9 @@ def suspected_losing_move(decisions: list[dict[str, Any]], events: list[dict[str
 
 
 def state_after_decision(row: dict[str, Any], events: list[dict[str, Any]]) -> dict[str, Any]:
+    state_after = row.get("state_after", {}) if isinstance(row.get("state_after"), dict) else {}
+    if state_after:
+        return state_after
     after_hp = row.get("after_hp", {}) if isinstance(row.get("after_hp"), dict) else {}
     if after_hp:
         return {"hp": after_hp}
@@ -901,6 +1341,7 @@ def compact_decision_ref(decision: dict[str, Any]) -> dict[str, Any]:
         "id": decision.get("id", 0),
         "name": decision.get("name", ""),
         "reason": decision.get("reason", ""),
+        "reason_tags": decision.get("reason_tags", []),
         "score": decision.get("score"),
         "damage": decision.get("damage"),
         "lethal": decision.get("lethal"),
@@ -953,6 +1394,8 @@ def update_damage_model(weights: dict[str, Any], samples: Any) -> bool:
     for sample in samples:
         if not isinstance(sample, dict):
             continue
+        if str(sample.get("damage_kind", "direct") or "direct") != "direct":
+            continue
         base = float(sample.get("base_damage", 0.0) or 0.0)
         predicted = float(sample.get("predicted_damage", 0.0) or 0.0)
         actual = float(sample.get("actual_damage", 0.0) or 0.0)
@@ -1003,6 +1446,8 @@ def damage_feature_keys(features: dict[str, Any]) -> list[str]:
         return []
     keys = [
         f"kind:{features.get('kind', 'Unknown')}",
+        f"action:{features.get('action_type', 'Unknown')}",
+        f"damage_kind:{features.get('damage_kind', 'direct')}",
         f"element:{features.get('element', 'Physical')}",
         f"ratio:{features.get('ratio_bucket', 'even')}",
         f"defense:{features.get('defense_state', 'normal')}",
@@ -1195,11 +1640,17 @@ def compact_miscrit(item: dict[str, Any]) -> dict[str, Any]:
 
 def clean_decision(decision: dict[str, Any]) -> dict[str, Any]:
     debug = decision.get("debug", {}) if isinstance(decision.get("debug"), dict) else {}
+    candidates = debug.get("candidates", [])[:6] if isinstance(debug.get("candidates", []), list) else []
+    reason_value = decision.get("reason", "")
     return {
         "type": decision.get("type", "none"),
         "id": decision.get("id", 0),
         "name": debug.get("name", ""),
-        "reason": decision.get("reason", ""),
+        "reason": reason_value,
+        "reason_tags": reason_tags(decision.get("reason_tags", debug.get("reason_tags", reason_value))),
+        "action_type": decision.get("action_type", debug.get("type", decision.get("type", "none"))),
+        "chosen_probability": round(float(decision.get("chosen_probability", debug.get("chosen_probability", 1.0)) or 0.0), 8),
+        "candidate_rank": int(decision.get("candidate_rank", debug.get("candidate_rank", candidate_rank(candidates, decision.get("id", 0)))) or 0),
         "score": debug.get("score"),
         "damage": debug.get("damage"),
         "utility": debug.get("utility"),
@@ -1217,7 +1668,7 @@ def clean_decision(decision: dict[str, Any]) -> dict[str, Any]:
         "win_adjustment": debug.get("win_adjustment"),
         "lookahead_adjustment": debug.get("lookahead_adjustment"),
         "lookahead": debug.get("lookahead", {}),
-        "candidates": debug.get("candidates", [])[:6] if isinstance(debug.get("candidates", []), list) else [],
+        "candidates": candidates,
     }
 
 

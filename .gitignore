@@ -6,6 +6,7 @@ data/accounts/
 data/breed_log.json
 data/battle_ai_weights.json
 data/battle_history.json
+data/battle_schema.json
 data/battle_logs/
 data/event_log.jsonl
 data/miscrits_cache.json

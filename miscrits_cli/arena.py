@@ -683,13 +683,15 @@ class ArenaRunner:
                 recorder.observe_damage_samples(damage_samples)
                 self._log(log, "battle_state", phase="battle", opcode=opcode, data=summarize_battle_data(data), battle=snapshot)
                 if opcode == BATTLE_OPCODES["END"]:
-                    outcome = battle_outcome(state_model.winner, state_model.player_id, snapshot)
-                    grade = recorder.finish(outcome, turns_sent, snapshot)
+                    outcome_info = battle_outcome_info(state_model.winner, state_model.player_id, snapshot)
+                    outcome = str(outcome_info["outcome"])
+                    grade = recorder.finish(outcome, turns_sent, snapshot, str(outcome_info["source"]), float(outcome_info["confidence"]))
                     self._emit("battle_end", phase="finished", outcome=outcome, grade=grade, battle=snapshot)
                     return {"ended": True, "winner": state_model.winner, "outcome": outcome, "turns_sent": turns_sent, "grade": grade, "battle_log_id": recorder.battle_id}
                 if opcode == BATTLE_OPCODES["TERMINATE"]:
-                    outcome = battle_outcome(state_model.winner, state_model.player_id, snapshot)
-                    grade = recorder.finish(outcome, turns_sent, snapshot)
+                    outcome_info = battle_outcome_info(state_model.winner, state_model.player_id, snapshot)
+                    outcome = str(outcome_info["outcome"])
+                    grade = recorder.finish(outcome, turns_sent, snapshot, str(outcome_info["source"]), float(outcome_info["confidence"]))
                     self._emit("battle_terminate", phase="finished", outcome=outcome, grade=grade, battle=snapshot)
                     return {"terminated": True, "winner": state_model.winner, "outcome": outcome, "turns_sent": turns_sent, "grade": grade, "battle_log_id": recorder.battle_id}
                 if opcode != BATTLE_OPCODES["READY"]:
@@ -703,10 +705,12 @@ class ArenaRunner:
                         turns_sent += 1
             except (MiscritsError, TimeoutError, OSError) as exc:
                 snapshot = enrich_battle_snapshot(state_model.snapshot(), self.metadata)
-                outcome = battle_outcome(state_model.winner, state_model.player_id, snapshot)
+                outcome_info = battle_outcome_info(state_model.winner, state_model.player_id, snapshot)
                 if not is_recoverable_arena_error(exc) or reconnects >= 8:
+                    outcome_info = self._interrupted_outcome_info(state_model, snapshot, log)
+                    outcome = str(outcome_info["outcome"])
                     recorder.events.append({"timestamp": time.time(), "event": "interrupted", "turns": snapshot.get("turns", 0), "summary": {"error": str(exc) or exc.__class__.__name__}})
-                    grade = recorder.finish(outcome, turns_sent, snapshot)
+                    grade = recorder.finish(outcome, turns_sent, snapshot, str(outcome_info["source"]), float(outcome_info["confidence"]))
                     self._emit("battle_interrupted", phase="recovering", outcome=outcome, grade=grade, error=str(exc), battle=snapshot)
                     raise
                 reconnects += 1
@@ -723,6 +727,8 @@ class ArenaRunner:
                     match_id = self._reconnect_active_battle(rt, match_id, user_id, log)
                     deadline = max(deadline, time.monotonic() + min(float(config.timeout_seconds), 120.0))
                 except (MiscritsError, TimeoutError, OSError) as reconnect_exc:
+                    outcome_info = self._interrupted_outcome_info(state_model, snapshot, log)
+                    outcome = str(outcome_info["outcome"])
                     recorder.events.append(
                         {
                             "timestamp": time.time(),
@@ -731,12 +737,13 @@ class ArenaRunner:
                             "summary": {"error": str(reconnect_exc) or reconnect_exc.__class__.__name__},
                         }
                     )
-                    grade = recorder.finish(outcome, turns_sent, snapshot)
+                    grade = recorder.finish(outcome, turns_sent, snapshot, str(outcome_info["source"]), float(outcome_info["confidence"]))
                     self._emit("battle_interrupted", phase="recovering", outcome=outcome, grade=grade, error=str(reconnect_exc), battle=snapshot)
                     raise reconnect_exc
         snapshot = enrich_battle_snapshot(state_model.snapshot(), self.metadata)
-        outcome = battle_outcome(state_model.winner, state_model.player_id, snapshot)
-        grade = recorder.finish(outcome, turns_sent, snapshot)
+        outcome_info = battle_outcome_info(state_model.winner, state_model.player_id, snapshot)
+        outcome = str(outcome_info["outcome"])
+        grade = recorder.finish(outcome, turns_sent, snapshot, str(outcome_info["source"]), float(outcome_info["confidence"]))
         self._emit("battle_timeout", phase="finished", outcome=outcome, grade=grade, battle=snapshot)
         return {"ended": False, "winner": state_model.winner, "outcome": outcome, "turns_sent": turns_sent, "reason": "timeout_or_turn_limit", "grade": grade, "battle_log_id": recorder.battle_id}
 
@@ -755,6 +762,15 @@ class ArenaRunner:
         if log is not None:
             self._log(log, "active_battle_check", phase="connecting", active=bool(match_id), match_id=match_id)
         return match_id
+
+    def _interrupted_outcome_info(self, state_model: BattleState, snapshot: dict[str, Any], log: list[dict[str, Any]]) -> dict[str, Any]:
+        outcome = battle_outcome_info(state_model.winner, state_model.player_id, snapshot)
+        if outcome["outcome"] != "unknown":
+            return outcome
+        active_match_id = self._current_active_battle_id(log)
+        if active_match_id:
+            return {"outcome": "unknown", "source": "active_battle_present", "confidence": 0.15}
+        return {"outcome": "unknown", "source": "active_battle_absent", "confidence": 0.25}
 
     def _reconnect_active_battle(
         self,
@@ -1691,12 +1707,20 @@ def enrich_battle_snapshot(snapshot: dict[str, Any], metadata: dict[int, dict[st
 
 
 def battle_outcome(winner: str, player_id: str, snapshot: dict[str, Any] | None = None) -> str:
-    if not winner:
-        inferred = infer_battle_outcome(snapshot or {})
-        if inferred:
-            return inferred
-        return "unknown"
-    return "victory" if str(winner) == str(player_id) else "defeat"
+    return str(battle_outcome_info(winner, player_id, snapshot)["outcome"])
+
+
+def battle_outcome_info(winner: str, player_id: str, snapshot: dict[str, Any] | None = None) -> dict[str, Any]:
+    if winner:
+        return {
+            "outcome": "victory" if str(winner) == str(player_id) else "defeat",
+            "source": "server_winner",
+            "confidence": 1.0,
+        }
+    inferred = infer_battle_outcome(snapshot or {})
+    if inferred:
+        return {"outcome": inferred, "source": "snapshot_elimination", "confidence": 0.95}
+    return {"outcome": "unknown", "source": "unknown", "confidence": 0.0}
 
 
 def infer_battle_outcome(snapshot: dict[str, Any]) -> str:

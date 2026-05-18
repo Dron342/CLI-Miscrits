@@ -4,7 +4,7 @@ import random
 import re
 from typing import Any
 
-from .battle_learning import damage_multiplier, learned_bonus, matchup_memory
+from .battle_learning import damage_kind_for_action, damage_multiplier, learned_bonus, matchup_memory, reason_tags
 
 
 BATTLE_OPCODES = {
@@ -121,6 +121,9 @@ class BattleState:
             loser = str(data.get("loser", ""))
             if loser:
                 self.winner = self.foe_id if loser == self.player_id else self.player_id
+        action_winner = winner_from_actions(data)
+        if action_winner:
+            self.winner = action_winner
         self.next_turn = str(data.get("next_turn", self.next_turn) or self.next_turn)
         self.pending = bool(data.get("pending", self.pending))
         self.turns = int(data.get("turns", self.turns) or self.turns)
@@ -159,6 +162,10 @@ class BattleState:
             actual = max(0.0, float(action.get("damage", 0) or 0))
             if actual <= 0.0 and not bool(action.get("crit", False)):
                 continue
+            action_type = str(action.get("type", "") or "")
+            damage_kind = damage_kind_for_action(action_type)
+            details["features"]["action_type"] = action_type or "Unknown"
+            details["features"]["damage_kind"] = damage_kind
             samples.append(
                 {
                     "turns": self.turns,
@@ -174,6 +181,8 @@ class BattleState:
                     "attacker": compact_battle_miscrit(attacker, True),
                     "defender": compact_battle_miscrit(defender, True),
                     "action": summarize_damage_action(action),
+                    "action_type": action_type,
+                    "damage_kind": damage_kind,
                     "base_damage": round(float(details["base_damage"]), 4),
                     "predicted_damage": round(float(details["damage"]), 4),
                     "actual_damage": round(actual, 4),
@@ -209,6 +218,10 @@ class BattleState:
                 "type": "ability",
                 "id": ability_choice["id"],
                 "reason": ability_choice.get("reason", "best_scored_ability"),
+                "reason_tags": ability_choice.get("reason_tags", reason_tags(ability_choice.get("reason", ""))),
+                "action_type": ability_choice.get("type", "ability"),
+                "chosen_probability": ability_choice.get("chosen_probability", 1.0),
+                "candidate_rank": ability_choice.get("candidate_rank", 0),
                 "debug": ability_choice,
             }
         if switch_choice["id"] and not bool(switch_choice.get("lethal_incoming", False)):
@@ -429,6 +442,9 @@ class BattleState:
         return {
             "id": int(ranked[0]["id"] or 0),
             "reason": ranked[0].get("reason", "better_matchup"),
+            "type": "switch",
+            "candidate_rank": 1,
+            "chosen_probability": 1.0,
             "score": ranked[0]["score"],
             "active_score": round(float(active_eval.get("score", 0.0) or 0.0), 3),
             "gain": round(float(ranked[0]["score"]) - float(active_eval.get("score", 0.0) or 0.0), 3),
@@ -456,11 +472,15 @@ class BattleState:
             score_data = score_ability(ability, miscrit, foe, self.pvp, plan)
             ranked.append(score_data)
         ranked.sort(key=lambda item: float(item["score"]), reverse=True)
+        for index, item in enumerate(ranked, start=1):
+            item["candidate_rank"] = index
         finishers = [item for item in ranked if bool(item.get("lethal", False)) or bool(item.get("near_lethal", False))]
         if finishers:
             finishers.sort(key=lambda item: (bool(item.get("lethal", False)), float(item.get("damage", 0.0) or 0.0), float(item.get("score", 0.0) or 0.0)), reverse=True)
             best = finishers[0]
             best["reason"] = "lethal_finish" if bool(best.get("lethal", False)) else "near_lethal_pressure"
+            best["reason_tags"] = [best["reason"]]
+            best["chosen_probability"] = 1.0
             return {**best, "candidates": ranked[:6]}
         best = ranked[0]
         best_attack = next((item for item in ranked if str(item.get("type", "") or "") == "Attack"), None)
@@ -473,14 +493,19 @@ class BattleState:
             if utility_streak >= MAX_UTILITY_STREAK or attack_is_close:
                 forced = dict(best_attack)
                 forced["reason"] = "forced_attack_after_utility" if utility_streak >= MAX_UTILITY_STREAK else "attack_followup"
+                forced["reason_tags"] = [forced["reason"]]
+                forced["chosen_probability"] = 1.0
                 forced["utility_streak_before"] = utility_streak
                 forced["attack_followup_ratio"] = followup_ratio
                 return {**forced, "candidates": ranked[:6]}
         explored = exploratory_ability_choice(ranked, plan or {})
         if explored:
+            previous_tags = explored.get("reason_tags", reason_tags(explored.get("reason", "")))
             explored["reason"] = "explore_" + str(explored.get("reason", "alternate_ability"))
+            explored["reason_tags"] = ["explore", *previous_tags]
             explored["exploration"] = True
             return {**explored, "candidates": ranked[:6]}
+        best["chosen_probability"] = best.get("chosen_probability", deterministic_ability_probability(ranked, plan or {}))
         return {**best, "reason": best.get("reason", "best_scored_ability"), "candidates": ranked[:6]}
 
     def _utility_streak(self, active: dict[str, Any], foe: dict[str, Any]) -> int:
@@ -498,12 +523,23 @@ class BattleState:
 
 
 def exploratory_ability_choice(ranked: list[dict[str, Any]], plan: dict[str, Any]) -> dict[str, Any]:
-    if len(ranked) < 2:
+    rate, pool, weights = ability_exploration_policy(ranked, plan)
+    if not pool or random.random() >= rate:
         return {}
+    chosen = dict(random.choices(pool, weights=weights, k=1)[0])
+    total_weight = sum(weights)
+    chosen_weight = weights[pool.index(next(item for item in pool if int(item.get("id", 0) or 0) == int(chosen.get("id", 0) or 0)))]
+    chosen["chosen_probability"] = rate * chosen_weight / max(0.000001, total_weight)
+    return chosen
+
+
+def ability_exploration_policy(ranked: list[dict[str, Any]], plan: dict[str, Any]) -> tuple[float, list[dict[str, Any]], list[float]]:
+    if len(ranked) < 2:
+        return 0.0, [], []
     best = ranked[0]
     best_score = float(best.get("score", 0.0) or 0.0)
     if bool(best.get("lethal", False)) or bool(best.get("near_lethal", False)):
-        return {}
+        return 0.0, [], []
     rate = ABILITY_EXPLORATION_RATE
     if bool(plan.get("ahead", False)):
         rate *= 0.55
@@ -511,8 +547,7 @@ def exploratory_ability_choice(ranked: list[dict[str, Any]], plan: dict[str, Any
         rate *= 1.7
     if bool(plan.get("last_ally", False)) or bool(plan.get("last_foe", False)):
         rate *= 0.6
-    if random.random() >= min(0.18, max(0.0, rate)):
-        return {}
+    rate = min(0.18, max(0.0, rate))
     pool = []
     for item in ranked[1:6]:
         score = float(item.get("score", 0.0) or 0.0)
@@ -524,10 +559,28 @@ def exploratory_ability_choice(ranked: list[dict[str, Any]], plan: dict[str, Any
             continue
         pool.append(item)
     if not pool:
-        return {}
+        return 0.0, [], []
     floor = min(float(item.get("score", 0.0) or 0.0) for item in pool)
     weights = [max(0.2, float(item.get("score", 0.0) or 0.0) - floor + 1.0) for item in pool]
-    return dict(random.choices(pool, weights=weights, k=1)[0])
+    return rate, pool, weights
+
+
+def deterministic_ability_probability(ranked: list[dict[str, Any]], plan: dict[str, Any]) -> float:
+    rate, pool, _ = ability_exploration_policy(ranked, plan)
+    return 1.0 - rate if pool else 1.0
+
+
+def winner_from_actions(data: dict[str, Any]) -> str:
+    actions = data.get("actions", []) if isinstance(data, dict) else []
+    if not isinstance(actions, list):
+        return ""
+    for action in actions:
+        if not isinstance(action, dict):
+            continue
+        winner = str(action.get("winner", "") or "")
+        if winner:
+            return winner
+    return ""
 
 
 def should_switch(active: dict[str, Any], foe: dict[str, Any], ability_choice: dict[str, Any], switch_choice: dict[str, Any], plan: dict[str, Any] | None = None) -> bool:
@@ -781,7 +834,7 @@ def score_ability(ability: dict[str, Any], attacker: dict[str, Any], defender: d
         else:
             reasons.append("fallback")
     reason = "_".join(reasons)
-    score += learned_bonus("ability", int(ability.get("id", 0) or 0), attacker, defender, reason)
+    score += learned_bonus("ability", int(ability.get("id", 0) or 0), attacker, defender, reasons)
     score += matchup_memory(attacker, defender) * 0.35
     win_adjustment, win_reasons = win_condition_adjustment(effective, kind, damage, accuracy, utility, attacker, defender, plan or {})
     if win_adjustment:
@@ -813,6 +866,7 @@ def score_ability(ability: dict[str, Any], attacker: dict[str, Any], defender: d
         "lookahead": lookahead,
         "win_plan": (plan or {}).get("mode", "even"),
         "reason": reason,
+        "reason_tags": list(dict.fromkeys(reasons)),
     }
 
 
