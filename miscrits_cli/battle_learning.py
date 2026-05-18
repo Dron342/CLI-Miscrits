@@ -15,7 +15,7 @@ BATTLE_WEIGHTS_FILE = DATA_DIR / "battle_ai_weights.json"
 BATTLE_LOG_DIR = DATA_DIR / "battle_logs"
 BATTLE_LOG_INDEX_FILE = BATTLE_LOG_DIR / "index.json"
 BATTLE_SCHEMA_FILE = DATA_DIR / "battle_schema.json"
-BATTLE_SCHEMA_VERSION = 6
+BATTLE_SCHEMA_VERSION = 7
 MAX_HISTORY = 0
 MAX_EVENTS_PER_BATTLE = 5000
 MAX_DECISIONS_PER_BATTLE = 1000
@@ -1181,7 +1181,6 @@ def annotate_candidate_set(row: dict[str, Any]) -> None:
     decision = row.get("decision", {}) if isinstance(row.get("decision"), dict) else {}
     candidates = decision.get("candidates", []) if isinstance(decision.get("candidates"), list) else []
     chosen_id = int(decision.get("id", 0) or 0)
-    chosen_kind = str(decision.get("type", "") or "")
     observed_return = float(row.get("return_from_here", 0.0) or 0.0)
     decision["chosen_id"] = chosen_id
     decision["candidate_count"] = len(candidates)
@@ -1191,8 +1190,7 @@ def annotate_candidate_set(row: dict[str, Any]) -> None:
         if not isinstance(candidate, dict):
             continue
         candidate.setdefault("candidate_rank", index)
-        candidate_kind = str(candidate.get("kind", candidate.get("type", chosen_kind)) or chosen_kind)
-        is_chosen = int(candidate.get("id", 0) or 0) == chosen_id and candidate_kind == chosen_kind
+        is_chosen = candidate_matches_decision(candidate, decision)
         candidate["chosen"] = bool(is_chosen)
         candidate["observed"] = bool(is_chosen)
         if is_chosen:
@@ -1212,6 +1210,22 @@ def candidate_relative_label(is_chosen: bool, observed_return: float) -> str:
     if not is_chosen and observed_return > 0:
         return "below_chosen"
     return "above_chosen"
+
+
+def candidate_matches_decision(candidate: dict[str, Any], decision: dict[str, Any]) -> bool:
+    if not isinstance(candidate, dict) or not isinstance(decision, dict):
+        return False
+    candidate_id = int(candidate.get("id", 0) or 0)
+    decision_id = int(decision.get("id", 0) or 0)
+    if not candidate_id or candidate_id != decision_id:
+        return False
+    decision_kind = str(decision.get("type", "") or "").casefold()
+    candidate_kind = str(candidate.get("kind", candidate.get("type", "")) or "").casefold()
+    if decision_kind == "ability":
+        return candidate_kind not in {"", "switch"}
+    if decision_kind == "switch":
+        return candidate_kind in {"", "switch"}
+    return candidate_kind == decision_kind
 
 
 def candidate_value_features(row: dict[str, Any], candidate: dict[str, Any]) -> dict[str, Any]:
@@ -1388,15 +1402,12 @@ def update_candidate_rank_model(weights: dict[str, Any], row: dict[str, Any], re
     candidates = decision.get("candidates", []) if isinstance(decision.get("candidates"), list) else []
     if len(candidates) < 2 or abs(reward) < 0.08:
         return 0
-    chosen_id = int(decision.get("id", 0) or 0)
-    chosen_kind = str(decision.get("type", "") or "")
     chosen = next(
         (
             item
             for item in candidates
             if isinstance(item, dict)
-            and int(item.get("id", 0) or 0) == chosen_id
-            and str(item.get("type", chosen_kind) or chosen_kind) == chosen_kind
+            and candidate_matches_decision(item, decision)
         ),
         None,
     )
@@ -1408,7 +1419,7 @@ def update_candidate_rank_model(weights: dict[str, Any], row: dict[str, Any], re
     for candidate in candidates:
         if not isinstance(candidate, dict) or candidate is chosen:
             continue
-        if int(candidate.get("id", 0) or 0) == chosen_id and str(candidate.get("type", chosen_kind) or chosen_kind) == chosen_kind:
+        if candidate_matches_decision(candidate, decision):
             continue
         candidate_features = candidate.get("value_features", {}) if isinstance(candidate.get("value_features"), dict) else candidate_value_features(row, candidate)
         if reward > 0:
