@@ -8,7 +8,7 @@ import time
 from .actions import player_summary
 from .arena import ArenaRunConfig, ArenaRunner
 from .asset_cache import AssetCache
-from .auto_update import git_update_capability, install_git_tag, restart_current_process
+from .auto_update import git_update_capability, install_git_tag, restart_cli_process, restart_current_process
 from .battle_learning import learning_status, load_battle_history, load_battle_log, load_battle_log_index
 from .breeding import BreedConfig, BreedRunner, evo_from_level
 from .config import DEFAULT_CONFIG, SESSION_FILE
@@ -24,6 +24,7 @@ from . import __version__
 
 
 def main(argv: list[str] | None = None) -> int:
+    raw_argv = list(argv) if argv is not None else sys.argv[1:]
     parser = argparse.ArgumentParser(prog="miscrits-cli")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -293,10 +294,18 @@ def main(argv: list[str] | None = None) -> int:
                 stop_on_error=args.stop_on_error if args.repeat <= 0 else not args.continue_on_error,
             )
             job_id = f"cli-{int(time.time())}"
+            completed_runs = 0
+            pending_update_tag = ""
+            next_update_check_at = time.monotonic() + 60.0
 
             def progress(update: dict[str, object]) -> None:
+                nonlocal completed_runs
                 event_name = str(update.get("event", "arena_event"))
                 phase = str(update.get("phase", ""))
+                if event_name == "loop_battle_complete":
+                    loop = update.get("loop", {})
+                    if isinstance(loop, dict):
+                        completed_runs = max(completed_runs, int(loop.get("completed", 0) or 0))
                 level = "warning" if phase == "recovering" or event_name.startswith("recoverable_") else ("error" if phase == "error" or update.get("error") else "info")
                 log_event(
                     event_name,
@@ -326,9 +335,33 @@ def main(argv: list[str] | None = None) -> int:
                 },
             )
             runner = ArenaRunner(client, progress=progress)
-            print_json(
-                runner.run_loop(config) if args.repeat != 1 and not args.dry_run else runner.run(config)
-            )
+            if args.repeat != 1 and not args.dry_run:
+                def should_stop_for_update() -> bool:
+                    nonlocal next_update_check_at, pending_update_tag
+                    if args.repeat > 0 and completed_runs >= args.repeat:
+                        return False
+                    now = time.monotonic()
+                    if now < next_update_check_at:
+                        return False
+                    next_update_check_at = now + 60.0
+                    update = check_for_updates()
+                    if not update.get("ok") or not update.get("update_available"):
+                        return False
+                    capability = git_update_capability()
+                    if not capability.get("ok"):
+                        return False
+                    pending_update_tag = str(update.get("latest_tag", "") or "")
+                    return bool(pending_update_tag)
+
+                result = runner.run_loop(config, should_stop=should_stop_for_update)
+                remaining = remaining_repeat_count(args.repeat, result)
+                if result.get("stopped") and pending_update_tag and (args.repeat <= 0 or remaining > 0):
+                    installed = install_git_tag(pending_update_tag)
+                    if installed.get("ok"):
+                        restart_cli_process(rewrite_repeat_arg(raw_argv, remaining))
+                print_json(result)
+            else:
+                print_json(runner.run(config))
             return 0
         if args.command == "wish":
             print_json(client.wish(args.kind).__dict__)
@@ -414,6 +447,27 @@ def maybe_auto_update_before_command(command: str) -> None:
     installed = install_git_tag(str(result.get("latest_tag", "") or ""))
     if installed.get("ok"):
         restart_current_process()
+
+
+def remaining_repeat_count(requested: int, result: dict[str, object]) -> int:
+    if requested <= 0:
+        return 0
+    loop = result.get("loop", {})
+    completed = int(loop.get("completed", 0) or 0) if isinstance(loop, dict) else 0
+    return max(0, int(requested) - completed)
+
+
+def rewrite_repeat_arg(argv: list[str], remaining: int) -> list[str]:
+    updated = list(argv)
+    if "--repeat" in updated:
+        index = updated.index("--repeat")
+        if index + 1 < len(updated):
+            updated[index + 1] = str(remaining)
+        else:
+            updated.append(str(remaining))
+        return updated
+    updated.extend(["--repeat", str(remaining)])
+    return updated
 
 
 if __name__ == "__main__":

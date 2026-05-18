@@ -69,6 +69,10 @@ def restart_current_process() -> None:
     os.execv(sys.executable, [sys.executable, *sys.argv])
 
 
+def restart_cli_process(args: list[str]) -> None:
+    os.execv(sys.executable, [sys.executable, "-m", "miscrits_cli", *args])
+
+
 def resume_payload(intents: list[dict[str, Any]], target_tag: str, current_version: str) -> dict[str, Any]:
     return {
         "created_at": time.time(),
