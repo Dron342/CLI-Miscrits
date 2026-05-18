@@ -70,6 +70,12 @@ python -m miscrits_cli rpc update_location --payload "{\"locationId\":1,\"areaId
 - После установки новой версии процесс сам перезапускается и восстанавливает остановленный план либо оставшееся число боёв арены.
 - Автообновление выполняется только на чистом Git-checkout'е и только через fast-forward, чтобы не затирать локальные изменения.
 
+## Изменения в 0.3.5
+
+- Добавлена replay-тренировка value/rank моделей несколькими перемешанными эпохами при пересборке истории.
+- Confidence моделей теперь считается по уникальным решениям и парам кандидатов, а не по повторным replay-проходам.
+- Обновлена версия приложения до `0.3.5`.
+
 ## Breeding
 
 The S+ breeding planner uses only level 1 miscrits, skips team members and favorites, and avoids spending unique S+ copies unless explicitly allowed.

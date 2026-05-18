@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import random
 import time
 import uuid
 from collections import Counter
@@ -15,7 +16,7 @@ BATTLE_WEIGHTS_FILE = DATA_DIR / "battle_ai_weights.json"
 BATTLE_LOG_DIR = DATA_DIR / "battle_logs"
 BATTLE_LOG_INDEX_FILE = BATTLE_LOG_DIR / "index.json"
 BATTLE_SCHEMA_FILE = DATA_DIR / "battle_schema.json"
-BATTLE_SCHEMA_VERSION = 11
+BATTLE_SCHEMA_VERSION = 12
 MAX_HISTORY = 0
 MAX_EVENTS_PER_BATTLE = 5000
 MAX_DECISIONS_PER_BATTLE = 1000
@@ -44,6 +45,8 @@ RANK_MODEL_MAX_WEIGHT = 3.0
 RANK_MODEL_MIN_PAIRS = 80
 RANK_MODEL_FULL_CONFIDENCE_PAIRS = 5000
 RANK_SCORE_SCALE = 8.0
+REPLAY_TRAINING_EPOCHS = 5
+REPLAY_TRAINING_SEED = 342
 DAMAGE_ABILITY_TYPES = {"Attack", "Bleed", "Poison", "Dot", "Disease", "SwitchCurse"}
 TICK_DAMAGE_ACTION_TYPES = {
     "antihealdamage",
@@ -164,6 +167,8 @@ def default_value_model() -> dict[str, Any]:
     return {
         "version": 1,
         "samples": 0,
+        "unique_samples": 0,
+        "replay_epochs": 0,
         "mae": 0.0,
         "bias": 0.0,
         "weights": {},
@@ -174,6 +179,8 @@ def default_rank_model() -> dict[str, Any]:
     return {
         "version": 1,
         "pairs": 0,
+        "unique_pairs": 0,
+        "replay_epochs": 0,
         "mae": 0.0,
         "weights": {},
     }
@@ -223,7 +230,8 @@ def rebuild_battle_log_files(history: list[dict[str, Any]]) -> None:
 def rebuild_weights_from_history(history: list[dict[str, Any]]) -> None:
     weights = default_weights()
     for entry in history:
-        apply_battle_to_weights(weights, entry)
+        apply_battle_to_weights(weights, entry, train_value_rank=False)
+    replay_train_value_rank_models(weights, history)
     save_weights(weights)
 
 
@@ -466,8 +474,9 @@ def action_value_estimate(features: dict[str, Any]) -> dict[str, Any]:
     weights = load_weights()
     model = weights.get("value_model", {}) if isinstance(weights.get("value_model"), dict) else {}
     samples = int(model.get("samples", 0) or 0)
+    unique_samples = int(model.get("unique_samples", samples) or 0)
     value = predict_value(model, features)
-    confidence = clamp(samples / float(VALUE_MODEL_FULL_CONFIDENCE_SAMPLES), 0.0, 1.0)
+    confidence = clamp(unique_samples / float(VALUE_MODEL_FULL_CONFIDENCE_SAMPLES), 0.0, 1.0)
     if samples < VALUE_MODEL_MIN_SAMPLES:
         return {"expected_value": 0.0, "adjustment": 0.0, "confidence": confidence, "samples": samples}
     adjustment = clamp(value, -MAX_RETURN, MAX_RETURN) * VALUE_SCORE_SCALE * confidence
@@ -483,8 +492,9 @@ def action_rank_estimate(features: dict[str, Any]) -> dict[str, Any]:
     weights = load_weights()
     model = weights.get("rank_model", {}) if isinstance(weights.get("rank_model"), dict) else {}
     pairs = int(model.get("pairs", 0) or 0)
+    unique_pairs = int(model.get("unique_pairs", pairs) or 0)
     score = predict_rank_score(model, features)
-    confidence = clamp(pairs / float(RANK_MODEL_FULL_CONFIDENCE_PAIRS), 0.0, 1.0)
+    confidence = clamp(unique_pairs / float(RANK_MODEL_FULL_CONFIDENCE_PAIRS), 0.0, 1.0)
     if pairs < RANK_MODEL_MIN_PAIRS:
         return {"rank_value": 0.0, "adjustment": 0.0, "confidence": confidence, "pairs": pairs}
     adjustment = clamp(score, -MAX_RETURN, MAX_RETURN) * RANK_SCORE_SCALE * confidence
@@ -1352,7 +1362,7 @@ def predict_rank_score(model: dict[str, Any], features: dict[str, Any]) -> float
     return clamp(score, -MAX_RETURN, MAX_RETURN)
 
 
-def update_value_model(weights: dict[str, Any], row: dict[str, Any], target: float) -> bool:
+def update_value_model(weights: dict[str, Any], row: dict[str, Any], target: float, count_unique: bool = True) -> bool:
     model = weights.get("value_model")
     if not isinstance(model, dict):
         model = default_value_model()
@@ -1366,6 +1376,8 @@ def update_value_model(weights: dict[str, Any], row: dict[str, Any], target: flo
     prediction = predict_value(model, features)
     error = clamp(target - prediction, -MAX_RETURN, MAX_RETURN)
     count = int(model.get("samples", 0) or 0) + 1
+    if count_unique:
+        model["unique_samples"] = int(model.get("unique_samples", 0) or 0) + 1
     lr = VALUE_MODEL_LEARNING_RATE / (1.0 + min(2.0, count / 2500.0))
     model["bias"] = round(clamp(float(model.get("bias", 0.0) or 0.0) + lr * error, -MAX_RETURN, MAX_RETURN), 6)
     for key, feature_value in value_feature_vector(features).items():
@@ -1378,7 +1390,7 @@ def update_value_model(weights: dict[str, Any], row: dict[str, Any], target: flo
     return True
 
 
-def update_rank_model(weights: dict[str, Any], preferred: dict[str, Any], rejected: dict[str, Any], strength: float) -> bool:
+def update_rank_model(weights: dict[str, Any], preferred: dict[str, Any], rejected: dict[str, Any], strength: float, count_unique: bool = True) -> bool:
     model = weights.get("rank_model")
     if not isinstance(model, dict):
         model = default_rank_model()
@@ -1396,6 +1408,8 @@ def update_rank_model(weights: dict[str, Any], preferred: dict[str, Any], reject
     target = clamp(0.35 + abs(strength), 0.35, 1.35)
     error = clamp(target - margin, -2.0, 2.0)
     count = int(model.get("pairs", 0) or 0) + 1
+    if count_unique:
+        model["unique_pairs"] = int(model.get("unique_pairs", 0) or 0) + 1
     lr = RANK_MODEL_LEARNING_RATE / (1.0 + min(2.0, count / 2500.0))
     for key in keys:
         delta = preferred_vector.get(key, 0.0) - rejected_vector.get(key, 0.0)
@@ -1410,7 +1424,7 @@ def update_rank_model(weights: dict[str, Any], preferred: dict[str, Any], reject
     return True
 
 
-def update_candidate_rank_model(weights: dict[str, Any], row: dict[str, Any], reward: float) -> int:
+def update_candidate_rank_model(weights: dict[str, Any], row: dict[str, Any], reward: float, count_unique: bool = True) -> int:
     decision = row.get("decision", {}) if isinstance(row.get("decision"), dict) else {}
     candidates = decision.get("candidates", []) if isinstance(decision.get("candidates"), list) else []
     if len(candidates) < 2 or abs(reward) < 0.08:
@@ -1436,14 +1450,50 @@ def update_candidate_rank_model(weights: dict[str, Any], row: dict[str, Any], re
             continue
         candidate_features = candidate.get("value_features", {}) if isinstance(candidate.get("value_features"), dict) else candidate_value_features(row, candidate)
         if reward > 0:
-            if update_rank_model(weights, chosen_features, candidate_features, strength):
+            if update_rank_model(weights, chosen_features, candidate_features, strength, count_unique=count_unique):
                 updates += 1
-        elif update_rank_model(weights, candidate_features, chosen_features, strength):
+        elif update_rank_model(weights, candidate_features, chosen_features, strength, count_unique=count_unique):
             updates += 1
     return updates
 
 
-def apply_battle_to_weights(weights: dict[str, Any], entry: dict[str, Any]) -> bool:
+def replay_training_rows(history: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for entry in history:
+        decisions = entry.get("decisions", []) if isinstance(entry.get("decisions"), list) else []
+        for row in decisions:
+            if not isinstance(row, dict) or not decision_applied(row):
+                continue
+            decision = row.get("decision", {}) if isinstance(row.get("decision"), dict) else {}
+            if isinstance(decision, dict):
+                rows.append(row)
+    return rows
+
+
+def replay_train_value_rank_models(weights: dict[str, Any], history: list[dict[str, Any]], epochs: int = REPLAY_TRAINING_EPOCHS) -> None:
+    rows = replay_training_rows(history)
+    value_model = weights.setdefault("value_model", default_value_model())
+    rank_model = weights.setdefault("rank_model", default_rank_model())
+    if not rows:
+        return
+    rng = random.Random(REPLAY_TRAINING_SEED)
+    for epoch in range(max(1, int(epochs or 1))):
+        shuffled = list(rows)
+        rng.shuffle(shuffled)
+        count_unique = epoch == 0
+        for row in shuffled:
+            reward = float(row.get("return_from_here", row.get("turn_reward", 0.0)) or 0.0)
+            update_value_model(weights, row, reward, count_unique=count_unique)
+            update_candidate_rank_model(weights, row, reward, count_unique=count_unique)
+    if isinstance(value_model, dict):
+        value_model["replay_epochs"] = int(epochs)
+        value_model["replay_rows"] = len(rows)
+    if isinstance(rank_model, dict):
+        rank_model["replay_epochs"] = int(epochs)
+        rank_model["replay_rows"] = len(rows)
+
+
+def apply_battle_to_weights(weights: dict[str, Any], entry: dict[str, Any], train_value_rank: bool = True) -> bool:
     changed = update_damage_model(weights, entry.get("damage_samples", []))
     applied_updates = 0
     for row in entry.get("decisions", []):
@@ -1453,8 +1503,9 @@ def apply_battle_to_weights(weights: dict[str, Any], entry: dict[str, Any]) -> b
         if not isinstance(decision, dict):
             continue
         reward = float(row.get("return_from_here", row.get("turn_reward", 0.0)) or 0.0)
-        update_value_model(weights, row, reward)
-        update_candidate_rank_model(weights, row, reward)
+        if train_value_rank:
+            update_value_model(weights, row, reward)
+            update_candidate_rank_model(weights, row, reward)
         if abs(reward) < 0.01:
             applied_updates += 1
             continue
