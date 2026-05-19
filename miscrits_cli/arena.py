@@ -100,6 +100,8 @@ class ArenaRunner:
         enrich_team(player, self.metadata)
         player["location"] = normalize_location(player_result.data)
         arena_info = self._arena_info(mode_name)
+        info = arena_info.get("info", arena_info) if isinstance(arena_info, dict) else {}
+        info = info if isinstance(info, dict) else {}
         validation = validate_arena_mode(mode_name, player, arena_info)
         return {
             "ok": True,
@@ -112,6 +114,12 @@ class ArenaRunner:
             "team_rating": team_rating_points(player),
             "arena_info": arena_info,
             "reward_progress": arena_reward_progress(mode_name, arena_info, self.metadata),
+            "time_left": arena_time_left(info),
+            "cap_target": platinum_cap_target(info),
+            "pa_cap": platinum_cap(info),
+            "pa_streak": optional_arena_int(info, "pa_streak", "paStreak", "streak"),
+            "pa_max_streak": optional_arena_int(info, "pa_max_streak", "paMaxStreak", "max_streak", "maxStreak"),
+            "streak_rewards": platinum_streak_rewards(info),
             "rules": arena_rules(mode_name),
         }
 
@@ -925,6 +933,36 @@ def arena_reward_progress(mode_name: str, arena_info: dict[str, Any], metadata: 
     rewards = raw_rewards if isinstance(raw_rewards, dict) else {}
     stats = info.get("stats", {})
     stats = stats if isinstance(stats, dict) else {}
+    if mode_name == "Platinum" and not rewards:
+        progress = platinum_cap(info, stats)
+        target = platinum_cap_target(info)
+        remaining = max(0, target - progress)
+        return {
+            "ok": target > 0,
+            "mode": mode_name,
+            "unit": "platinum",
+            "progress": progress,
+            "target": target,
+            "items": [
+                {
+                    "threshold": target,
+                    "claimed": progress >= target,
+                    "remaining_amount": remaining,
+                    "remaining_wins": remaining,
+                    "currency": "platinum",
+                    "unit": "platinum",
+                    "amount": target,
+                    "mid": 0,
+                    "name": "Платина за цикл",
+                    "rarity": "",
+                    "element": "",
+                    "raw": {"currency": "platinum", "amount": target, "kind": "cycle_cap"},
+                }
+            ],
+            "totals": {"platinum": target},
+            "claimed_totals": {"platinum": progress},
+            "remaining_totals": {"platinum": remaining},
+        }
     progress = arena_reward_wins(mode_name, info, stats)
     items: list[dict[str, Any]] = []
     totals: dict[str, int] = {}
@@ -967,6 +1005,7 @@ def arena_reward_progress(mode_name: str, arena_info: dict[str, Any], metadata: 
                 "claimed": claimed,
                 "remaining_wins": max(0, threshold - progress),
                 "currency": currency,
+                "unit": "wins",
                 "amount": amount,
                 "mid": mid,
                 "name": name,
@@ -979,6 +1018,7 @@ def arena_reward_progress(mode_name: str, arena_info: dict[str, Any], metadata: 
     return {
         "ok": bool(items),
         "mode": mode_name,
+        "unit": "wins",
         "progress": progress,
         "target": max((int(item["threshold"]) for item in items), default=0),
         "items": items,
@@ -996,6 +1036,91 @@ def arena_reward_wins(mode_name: str, info: dict[str, Any], stats: dict[str, Any
     if mode_name == "Daily":
         return int(stats.get("da_daily_wins", info.get("da_daily_wins", 0)) or 0)
     return 0
+
+
+def optional_arena_int(info: dict[str, Any], *keys: str) -> int | None:
+    for key in keys:
+        if key not in info:
+            continue
+        try:
+            return int(info.get(key) or 0)
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def arena_time_left(info: dict[str, Any]) -> float | None:
+    for key in ("time_left", "timeLeft", "reset_in", "resetIn", "seconds_left", "secondsLeft", "ttl"):
+        if key not in info:
+            continue
+        try:
+            value = float(info.get(key) or 0)
+        except (TypeError, ValueError):
+            continue
+        if value >= 0:
+            return value
+    return None
+
+
+def platinum_cap(info: dict[str, Any], stats: dict[str, Any] | None = None) -> int:
+    stats = stats if isinstance(stats, dict) else {}
+    for source in (info, stats):
+        for key in ("pa_cap", "paCap", "cap", "platinum_cap", "platinumCap"):
+            try:
+                value = int(source.get(key, 0) or 0)
+            except (AttributeError, TypeError, ValueError):
+                value = 0
+            if value > 0:
+                return value
+    return 0
+
+
+def platinum_cap_target(info: dict[str, Any]) -> int:
+    for key in ("pa_cap_max", "paMaxCap", "cap_max", "max_cap", "capMax", "pa_cap_limit", "pa_limit", "daily_cap"):
+        try:
+            value = int(info.get(key, 0) or 0)
+        except (TypeError, ValueError):
+            value = 0
+        if value > 0:
+            return value
+    return 300
+
+
+def platinum_streak_rewards(info: dict[str, Any]) -> list[dict[str, Any]]:
+    raw = first_dict(info, "pa_streak_rewards", "paStreakRewards", "streak_rewards", "streakRewards", "win_streak_rewards", "winStreakRewards")
+    if not raw:
+        return []
+    current = optional_arena_int(info, "pa_streak", "paStreak", "streak") or 0
+    items: list[dict[str, Any]] = []
+    for raw_threshold, reward in raw.items():
+        try:
+            threshold = int(raw_threshold)
+        except (TypeError, ValueError):
+            continue
+        if threshold <= 0 or not isinstance(reward, dict):
+            continue
+        currency = str(reward.get("currency", "platinum") or "platinum").strip().lower()
+        amount = arena_reward_amount(currency, reward)
+        items.append(
+            {
+                "threshold": threshold,
+                "currency": currency,
+                "amount": amount,
+                "claimed": current >= threshold,
+                "remaining_wins": max(0, threshold - current),
+                "raw": reward,
+            }
+        )
+    items.sort(key=lambda item: int(item["threshold"]))
+    return items
+
+
+def first_dict(info: dict[str, Any], *keys: str) -> dict[str, Any]:
+    for key in keys:
+        value = info.get(key)
+        if isinstance(value, dict):
+            return value
+    return {}
 
 
 def arena_reward_amount(currency: str, reward: dict[str, Any]) -> int:

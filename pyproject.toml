@@ -1,6 +1,6 @@
 [project]
 name = "cli-miscrits"
-version = "0.3.81"
+version = "0.3.82"
 description = "Standalone CLI and local web client scaffold for Miscrits."
 requires-python = ">=3.10"
 

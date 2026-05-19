@@ -9,7 +9,16 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from .arena import ArenaRunConfig, ArenaRunner, arena_reward_progress, is_recoverable_arena_error
+from .arena import (
+    ArenaRunConfig,
+    ArenaRunner,
+    arena_reward_progress,
+    arena_time_left,
+    is_recoverable_arena_error,
+    optional_arena_int,
+    platinum_cap,
+    platinum_streak_rewards,
+)
 from .breeding import metadata_by_mid
 from .config import DATA_DIR
 from .data_cache import DataCache
@@ -38,7 +47,15 @@ DEFAULT_PLAN = {
             "goal_mode": "arena_counter",
             "target_arena_wins": 5,
         },
-        {"id": "platinum_arena", "type": "arena", "mode": "platinum", "enabled": True, "target_platinum": 300},
+        {
+            "id": "platinum_arena",
+            "type": "arena",
+            "mode": "platinum",
+            "enabled": True,
+            "goal_mode": "arena_counter",
+            "target_cycle_platinum": 300,
+            "target_platinum": 300,
+        },
         {
             "id": "random_arena",
             "type": "arena",
@@ -167,16 +184,19 @@ class AccountPlanRunner:
                 snapshots[mode] = snapshot
             if mode == "platinum":
                 progress = arena_progress(snapshot, mode)
-                target = int(block.get("target_platinum", 300) or 300)
+                goal_mode, goal_progress, target = self.arena_goal(block, snapshot)
                 if mode not in arena_state_updated:
                     self.update_arena_state(
                         mode,
                         snapshot,
                         progress,
                         target=target,
+                        goal_mode=goal_mode,
+                        goal_progress=goal_progress,
                         rewards_complete=arena_rewards_complete(snapshot),
                     )
                     arena_state_updated.add(mode)
+                self.update_arena_block_state(block, goal_mode, goal_progress, target, snapshot)
             else:
                 goal_mode, goal_progress, target = self.arena_goal(block, snapshot)
                 if mode not in arena_state_updated:
@@ -240,15 +260,23 @@ class AccountPlanRunner:
             return None
         snapshot = self.load_arena_snapshot(mode)
         if mode == "platinum":
-            target = int(block.get("target_platinum", 300) or 300)
-            progress = arena_progress(snapshot, mode)
+            goal_mode, goal_progress, target = self.arena_goal(block, snapshot)
             rewards_complete = arena_rewards_complete(snapshot)
-            self.update_arena_state(mode, snapshot, progress, target=target, rewards_complete=rewards_complete)
+            self.update_arena_state(
+                mode,
+                snapshot,
+                arena_progress(snapshot, mode),
+                target=target,
+                goal_mode=goal_mode,
+                goal_progress=goal_progress,
+                rewards_complete=rewards_complete,
+            )
+            self.update_arena_block_state(block, goal_mode, goal_progress, target, snapshot)
             if rewards_complete:
                 self.emit("plan_arena_rewards_complete", "planning", mode=mode, block_id=block.get("id"))
                 return None
-            if progress < target:
-                return self.play_platinum_until(target, should_stop)
+            if goal_progress < target:
+                return self.play_platinum_until(block, should_stop)
             return None
         goal_mode, goal_progress, target = self.arena_goal(block, snapshot)
         rewards_complete = arena_rewards_complete(snapshot)
@@ -283,17 +311,26 @@ class AccountPlanRunner:
         self.emit("plan_step_complete", "action", step=state_key, success=result.success, result=result.raw)
         return PlanRunResult(True, "running", state=self.load_state())
 
-    def play_platinum_until(self, target_platinum: int, should_stop: Callable[[], bool] | None = None) -> PlanRunResult:
+    def play_platinum_until(self, block: dict[str, Any], should_stop: Callable[[], bool] | None = None) -> PlanRunResult:
         snapshot = self.load_arena_snapshot("platinum")
-        progress = arena_progress(snapshot, "platinum")
-        self.update_arena_state("platinum", snapshot, progress, target=target_platinum)
-        if progress >= target_platinum:
+        goal_mode, goal_progress, target = self.arena_goal(block, snapshot)
+        self.update_arena_state("platinum", snapshot, arena_progress(snapshot, "platinum"), target=target, goal_mode=goal_mode, goal_progress=goal_progress)
+        self.update_arena_block_state(block, goal_mode, goal_progress, target, snapshot)
+        if goal_progress >= target:
             return PlanRunResult(True, "running", state=self.load_state())
         result = self.play_one_arena("platinum", should_stop)
         next_snapshot = self.load_arena_snapshot("platinum")
-        next_progress = arena_progress(next_snapshot, "platinum")
-        self.update_arena_state("platinum", next_snapshot, next_progress, target=target_platinum)
-        self.emit("plan_platinum_progress", "planning", earned=next_progress, target=target_platinum)
+        next_goal_mode, next_goal_progress, next_target = self.arena_goal(block, next_snapshot)
+        self.update_arena_state(
+            "platinum",
+            next_snapshot,
+            arena_progress(next_snapshot, "platinum"),
+            target=next_target,
+            goal_mode=next_goal_mode,
+            goal_progress=next_goal_progress,
+        )
+        self.update_arena_block_state(block, next_goal_mode, next_goal_progress, next_target, next_snapshot)
+        self.emit("plan_platinum_progress", "planning", earned=next_goal_progress, target=next_target, goal_mode=next_goal_mode)
         return PlanRunResult(bool(result.get("ok") or result.get("recoverable")), "running", state=self.load_state())
 
     def play_arena_until(self, block: dict[str, Any], should_stop: Callable[[], bool] | None = None) -> PlanRunResult:
@@ -408,8 +445,10 @@ class AccountPlanRunner:
                 "time_left": snapshot.get("time_left"),
                 "banned": snapshot.get("banned", False),
                 "cap_target": snapshot.get("cap_target"),
-                "pa_streak": snapshot.get("info", {}).get("pa_streak"),
-                "pa_max_streak": snapshot.get("info", {}).get("pa_max_streak"),
+                "pa_cap": snapshot.get("pa_cap"),
+                "pa_streak": snapshot.get("pa_streak"),
+                "pa_max_streak": snapshot.get("pa_max_streak"),
+                "streak_rewards": snapshot.get("streak_rewards", []),
             }
             self.save_state_unlocked(state)
 
@@ -440,6 +479,14 @@ class AccountPlanRunner:
 
     def arena_goal(self, block: dict[str, Any], snapshot: dict[str, Any]) -> tuple[str, int, int]:
         mode = str(block.get("mode", "") or "").strip().casefold()
+        if mode == "platinum":
+            goal_mode = normalize_arena_goal_mode(block.get("goal_mode"))
+            if goal_mode == "cycle_wins":
+                target = max(0, int(block.get("target_cycle_platinum", block.get("target_platinum", 300)) or 0))
+                progress = self.arena_block_cycle_platinum(self.load_state(), str(block.get("id", "") or ""), snapshot)
+                return goal_mode, progress, target
+            target = max(0, int(block.get("target_platinum", 300) or 0))
+            return "arena_counter", arena_progress(snapshot, mode), target
         fallback_target = 5 if mode == "daily" else 6
         goal_mode = normalize_arena_goal_mode(block.get("goal_mode"))
         if goal_mode == "cycle_wins":
@@ -454,6 +501,23 @@ class AccountPlanRunner:
         if not isinstance(wins, dict):
             return 0
         return max(0, int(wins.get(block_id, 0) or 0))
+
+    def arena_block_cycle_platinum(self, state: dict[str, Any], block_id: str, snapshot: dict[str, Any]) -> int:
+        progress = arena_progress(snapshot, "platinum")
+        baselines = state.setdefault("arena_cycle_platinum_start", {})
+        if not isinstance(baselines, dict):
+            baselines = {}
+            state["arena_cycle_platinum_start"] = baselines
+        if block_id not in baselines:
+            baselines[block_id] = progress
+            self.save_state_unlocked(state)
+        try:
+            baseline = int(baselines.get(block_id, progress) or 0)
+        except (TypeError, ValueError):
+            baseline = progress
+            baselines[block_id] = progress
+            self.save_state_unlocked(state)
+        return max(0, progress - baseline)
 
     def record_arena_block_win(self, block: dict[str, Any]) -> None:
         block_id = str(block.get("id", "") or "").strip()
@@ -545,6 +609,7 @@ def reset_state_if_needed(state: dict[str, Any], player: dict[str, Any]) -> None
             "arenas": {},
             "arena_blocks": {},
             "arena_cycle_wins": {},
+            "arena_cycle_platinum_start": {},
         }
     )
 
@@ -603,6 +668,12 @@ def normalize_plan_blocks(blocks: Any) -> list[dict[str, Any]]:
             "enabled": bool(raw.get("enabled", True)),
         }
         if mode == "platinum":
+            goal_mode = normalize_arena_goal_mode(raw.get("goal_mode"))
+            block["goal_mode"] = goal_mode
+            block["target_cycle_platinum"] = max(
+                0,
+                int(raw.get("target_cycle_platinum", raw.get("target_platinum", 300)) or 0),
+            )
             block["target_platinum"] = max(0, int(raw.get("target_platinum", 300) or 0))
         else:
             fallback_target = 5 if mode == "daily" else 6
@@ -651,6 +722,14 @@ def blocks_from_legacy_steps(steps: Any) -> list[dict[str, Any]]:
             "type": "arena",
             "mode": "platinum",
             "enabled": source.get("platinum_arena", {}).get("enabled", True),
+            "goal_mode": normalize_arena_goal_mode(source.get("platinum_arena", {}).get("goal_mode")),
+            "target_cycle_platinum": int(
+                source.get("platinum_arena", {}).get(
+                    "target_cycle_platinum",
+                    source.get("platinum_arena", {}).get("target_platinum", 300),
+                )
+                or 300
+            ),
             "target_platinum": int(source.get("platinum_arena", {}).get("target_platinum", 300) or 300),
         },
         {
@@ -678,6 +757,8 @@ def legacy_steps_from_blocks(blocks: list[dict[str, Any]]) -> dict[str, Any]:
             if mode == "platinum" and key not in steps:
                 steps[key] = {
                     "enabled": bool(block.get("enabled", True)),
+                    "goal_mode": normalize_arena_goal_mode(block.get("goal_mode")),
+                    "target_cycle_platinum": int(block.get("target_cycle_platinum", block.get("target_platinum", 300)) or 300),
                     "target_platinum": int(block.get("target_platinum", 300) or 300),
                 }
             elif mode in {"battle", "daily", "random"} and key not in steps:
@@ -719,7 +800,11 @@ def normalize_arena_snapshot(mode: str, data: dict[str, Any], metadata: dict[int
             metadata or {},
         ),
         "cap_target": platinum_cap_target(info),
-        "time_left": info.get("time_left"),
+        "pa_cap": platinum_cap(info, stats),
+        "pa_streak": optional_arena_int(info, "pa_streak", "paStreak", "streak"),
+        "pa_max_streak": optional_arena_int(info, "pa_max_streak", "paMaxStreak", "max_streak", "maxStreak"),
+        "streak_rewards": platinum_streak_rewards(info),
+        "time_left": arena_time_left(info),
         "banned": bool(info.get("banned", False)),
         "raw": data,
     }

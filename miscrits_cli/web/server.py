@@ -1160,6 +1160,12 @@ def compact_event_payload(event: dict[str, Any]) -> dict[str, Any]:
                 "location_valid": value.get("location_valid"),
                 "team_rating": value.get("team_rating"),
                 "reward_progress": value.get("reward_progress"),
+                "time_left": value.get("time_left"),
+                "cap_target": value.get("cap_target"),
+                "pa_cap": value.get("pa_cap"),
+                "pa_streak": value.get("pa_streak"),
+                "pa_max_streak": value.get("pa_max_streak"),
+                "streak_rewards": value.get("streak_rewards"),
             }
         elif key == "prepare" and isinstance(value, dict):
             payload[key] = compact_prepare_payload(value)
@@ -1194,6 +1200,12 @@ def compact_live_update(event: dict[str, Any]) -> dict[str, Any]:
                 "location_valid": value.get("location_valid"),
                 "team_rating": value.get("team_rating"),
                 "reward_progress": value.get("reward_progress"),
+                "time_left": value.get("time_left"),
+                "cap_target": value.get("cap_target"),
+                "pa_cap": value.get("pa_cap"),
+                "pa_streak": value.get("pa_streak"),
+                "pa_max_streak": value.get("pa_max_streak"),
+                "streak_rewards": value.get("streak_rewards"),
             }
         elif key == "prepare" and isinstance(value, dict):
             payload[key] = compact_prepare_payload(value)
@@ -1227,6 +1239,12 @@ def compact_result_payload(result: dict[str, Any]) -> dict[str, Any]:
             "validation": result["status"].get("validation"),
             "team_rating": result["status"].get("team_rating"),
             "reward_progress": result["status"].get("reward_progress"),
+            "time_left": result["status"].get("time_left"),
+            "cap_target": result["status"].get("cap_target"),
+            "pa_cap": result["status"].get("pa_cap"),
+            "pa_streak": result["status"].get("pa_streak"),
+            "pa_max_streak": result["status"].get("pa_max_streak"),
+            "streak_rewards": result["status"].get("streak_rewards"),
         }
     if isinstance(result.get("battle"), dict):
         payload["battle"] = compact_battle_result(result["battle"])
@@ -3971,8 +3989,12 @@ INDEX_HTML = """<!doctype html>
         }
         const mode = String(block.mode || '').toLowerCase();
         const normalized = { id: block.id || `${mode}_arena_${index + 1}`, type: 'arena', mode, enabled: block.enabled !== false };
-        if (mode === 'platinum') normalized.target_platinum = Number(block.target_platinum || 300);
-        else {
+        if (mode === 'platinum') {
+          const goalMode = ['cycle_wins', 'arena_counter'].includes(String(block.goal_mode || '')) ? String(block.goal_mode) : 'arena_counter';
+          normalized.goal_mode = goalMode;
+          normalized.target_cycle_platinum = Number(block.target_cycle_platinum || block.target_platinum || 300);
+          normalized.target_platinum = Number(block.target_platinum || 300);
+        } else {
           const fallback = mode === 'daily' ? 5 : 6;
           const goalMode = ['cycle_wins', 'arena_counter'].includes(String(block.goal_mode || '')) ? String(block.goal_mode) : 'arena_counter';
           normalized.goal_mode = goalMode;
@@ -3989,7 +4011,7 @@ INDEX_HTML = """<!doctype html>
         { id: 'wish_sk', type: 'wish', kind: 'sk', enabled: !steps.wish_sk || steps.wish_sk.enabled !== false },
         { id: 'wish_vi', type: 'wish', kind: 'vi', enabled: !steps.wish_vi || steps.wish_vi.enabled !== false },
         { id: 'daily_arena', type: 'arena', mode: 'daily', enabled: !steps.daily_arena || steps.daily_arena.enabled !== false, goal_mode: 'arena_counter', target_arena_wins: pick(steps.daily_arena && steps.daily_arena.target_wins, 5), target_wins: pick(steps.daily_arena && steps.daily_arena.target_wins, 5) },
-        { id: 'platinum_arena', type: 'arena', mode: 'platinum', enabled: !steps.platinum_arena || steps.platinum_arena.enabled !== false, target_platinum: pick(steps.platinum_arena && steps.platinum_arena.target_platinum, 300) },
+        { id: 'platinum_arena', type: 'arena', mode: 'platinum', enabled: !steps.platinum_arena || steps.platinum_arena.enabled !== false, goal_mode: pick(steps.platinum_arena && steps.platinum_arena.goal_mode, 'arena_counter'), target_cycle_platinum: pick(steps.platinum_arena && steps.platinum_arena.target_cycle_platinum, pick(steps.platinum_arena && steps.platinum_arena.target_platinum, 300)), target_platinum: pick(steps.platinum_arena && steps.platinum_arena.target_platinum, 300) },
         { id: 'random_arena', type: 'arena', mode: 'random', enabled: !steps.random_arena || steps.random_arena.enabled !== false, goal_mode: 'arena_counter', target_arena_wins: pick(steps.random_arena && steps.random_arena.target_wins, 6), target_wins: pick(steps.random_arena && steps.random_arena.target_wins, 6) },
       ];
     }
@@ -4002,7 +4024,7 @@ INDEX_HTML = """<!doctype html>
         wish_vi: { id, type: 'wish', kind: 'vi', enabled: true },
         daily_arena: { id, type: 'arena', mode: 'daily', enabled: true, goal_mode: 'arena_counter', target_arena_wins: 5, target_cycle_wins: 5, target_wins: 5 },
         battle_arena: { id, type: 'arena', mode: 'battle', enabled: true, goal_mode: 'arena_counter', target_arena_wins: 5, target_cycle_wins: 5, target_wins: 5 },
-        platinum_arena: { id, type: 'arena', mode: 'platinum', enabled: true, target_platinum: 300 },
+        platinum_arena: { id, type: 'arena', mode: 'platinum', enabled: true, goal_mode: 'arena_counter', target_cycle_platinum: 300, target_platinum: 300 },
         random_arena: { id, type: 'arena', mode: 'random', enabled: true, goal_mode: 'cycle_wins', target_arena_wins: 6, target_cycle_wins: 6, target_wins: 6 },
       };
       if (!templates[selected]) return;
@@ -4030,8 +4052,14 @@ INDEX_HTML = """<!doctype html>
 
     function setPlanArenaGoalMode(index, value) {
       const block = planBlocks[index];
-      if (!block || block.type !== 'arena' || block.mode === 'platinum') return;
+      if (!block || block.type !== 'arena') return;
       block.goal_mode = value === 'cycle_wins' ? 'cycle_wins' : 'arena_counter';
+      if (block.mode === 'platinum') {
+        block.target_cycle_platinum = Number(block.target_cycle_platinum || block.target_platinum || 300);
+        block.target_platinum = Number(block.target_platinum || 300);
+        renderPlanBlocks();
+        return;
+      }
       const fallback = block.mode === 'daily' ? 5 : 6;
       block.target_cycle_wins = Number(block.target_cycle_wins || block.target_wins || fallback);
       block.target_arena_wins = Number(block.target_arena_wins || block.target_wins || fallback);
@@ -4041,8 +4069,13 @@ INDEX_HTML = """<!doctype html>
 
     function updatePlanArenaTarget(index, value) {
       const block = planBlocks[index];
-      if (!block || block.type !== 'arena' || block.mode === 'platinum') return;
+      if (!block || block.type !== 'arena') return;
       const numeric = Number(value || 0);
+      if (block.mode === 'platinum') {
+        if (block.goal_mode === 'cycle_wins') block.target_cycle_platinum = numeric;
+        else block.target_platinum = numeric;
+        return;
+      }
       if (block.goal_mode === 'cycle_wins') block.target_cycle_wins = numeric;
       else block.target_arena_wins = numeric;
       block.target_wins = numeric;
@@ -4055,7 +4088,10 @@ INDEX_HTML = """<!doctype html>
 
     function planBlockSummary(block) {
       if (block.type === 'wish') return 'Собрать один раз после ежедневного сброса';
-      if (block.mode === 'platinum') return `До ${escapeHtml(block.target_platinum || 0)} платины`;
+      if (block.mode === 'platinum') {
+        if (block.goal_mode === 'cycle_wins') return `Набрать ${escapeHtml(block.target_cycle_platinum || 0)} платины за цикл`;
+        return `До счётчика ${escapeHtml(block.target_platinum || 0)} платины`;
+      }
       if (block.goal_mode === 'cycle_wins') return `Выиграть ${escapeHtml(block.target_cycle_wins || 0)} боёв за цикл`;
       return `До счётчика ${escapeHtml(block.target_arena_wins || 0)} побед`;
     }
@@ -4070,7 +4106,19 @@ INDEX_HTML = """<!doctype html>
       root.innerHTML = planBlocks.map((block, index) => {
         const targetField = block.type === 'arena'
           ? block.mode === 'platinum'
-            ? `<div class="field"><label>Целевая платина</label><input type="number" min="0" value="${escapeHtml(block.target_platinum)}" onchange="updatePlanBlock(${index}, 'target_platinum', Number(this.value || 0))"></div>`
+            ? `<div class="plan-block-goal">
+                <div class="field">
+                  <label>Тип цели</label>
+                  <select onchange="setPlanArenaGoalMode(${index}, this.value)">
+                    <option value="cycle_wins" ${block.goal_mode === 'cycle_wins' ? 'selected' : ''}>Платина за цикл</option>
+                    <option value="arena_counter" ${block.goal_mode !== 'cycle_wins' ? 'selected' : ''}>Счётчик арены</option>
+                  </select>
+                </div>
+                <div class="field">
+                  <label>${block.goal_mode === 'cycle_wins' ? 'Платина за цикл' : 'Предел счётчика'}</label>
+                  <input type="number" min="0" value="${escapeHtml(block.goal_mode === 'cycle_wins' ? block.target_cycle_platinum : block.target_platinum)}" onchange="updatePlanArenaTarget(${index}, this.value)">
+                </div>
+              </div>`
             : `<div class="plan-block-goal">
                 <div class="field">
                   <label>Тип цели</label>
@@ -4235,6 +4283,9 @@ INDEX_HTML = """<!doctype html>
         const item = arenas[key] || {};
         const rewards = item.reward_steps || [];
         const rewardProgress = item.reward_progress || {};
+        const rewardItems = Array.isArray(rewardProgress.items) ? rewardProgress.items : [];
+        const streakRewards = Array.isArray(item.streak_rewards) ? item.streak_rewards : [];
+        const platinumProgress = pick(item.pa_cap, item.progress);
         return `<div class="log-card">
         <div class="log-head"><strong>${label}</strong><span class="chip">${escapeHtml(pick(item.progress, 0))} / ${escapeHtml(item.target || item.cap_target || (key === 'platinum' ? 300 : '-'))}</span></div>
           <div class="chips" style="margin-top:8px">
@@ -4242,11 +4293,15 @@ INDEX_HTML = """<!doctype html>
             ${item.rewards_complete ? '<span class="chip good">все награды получены</span>' : ''}
             ${item.goal_mode === 'cycle_wins' ? '<span class="chip">цель: победы за цикл</span>' : ''}
             ${item.goal_mode === 'arena_counter' ? '<span class="chip">цель: счётчик арены</span>' : ''}
-            ${item.time_left !== undefined && item.time_left !== null ? `<span class="chip">сброс через ${escapeHtml(item.time_left)}с</span>` : ''}
+            ${item.time_left !== undefined && item.time_left !== null ? `<span class="chip">сброс через ${escapeHtml(formatDuration(item.time_left))}</span>` : ''}
+            ${key === 'platinum' ? `<span class="chip">платина цикла ${escapeHtml(platinumProgress || 0)} / ${escapeHtml(item.cap_target || item.target || 300)}</span>` : ''}
             ${item.pa_streak !== undefined && item.pa_streak !== null ? `<span class="chip">серия ${escapeHtml(item.pa_streak)}</span>` : ''}
-            ${rewards.length ? `<span class="chip">награды ${rewards.map(escapeHtml).join(', ')}</span>` : '<span class="chip">награды не загружены</span>'}
+            ${item.pa_max_streak !== undefined && item.pa_max_streak !== null ? `<span class="chip">лучшая серия ${escapeHtml(item.pa_max_streak)}</span>` : ''}
+            ${streakRewards.length ? `<span class="chip">streak-награды ${streakRewards.length}</span>` : key === 'platinum' ? '<span class="chip">streak-награды не загружены</span>' : ''}
+            ${rewards.length ? `<span class="chip">награды ${rewards.map(escapeHtml).join(', ')}</span>` : rewardItems.length ? '' : '<span class="chip">награды не загружены</span>'}
           </div>
           ${renderArenaRewards(rewardProgress)}
+          ${key === 'platinum' ? renderPlatinumStreakRewards(streakRewards) : ''}
         </div>`;
       }).join('')}</div>`;
     }
@@ -4670,6 +4725,7 @@ INDEX_HTML = """<!doctype html>
       }
       const validation = data.validation || {};
       const team = data.team || [];
+      const streakRewards = Array.isArray(data.streak_rewards) ? data.streak_rewards : [];
       root.innerHTML = `
         <div class="log-card">
           <div class="log-head"><strong>${escapeHtml(modeLabel(data.mode || ''))}</strong><span class="chip ${validation.ok ? 'good' : 'warn'}">${validation.ok ? 'готово' : 'заблокировано'}</span></div>
@@ -4841,18 +4897,35 @@ INDEX_HTML = """<!doctype html>
       }
       const validation = data.validation || {};
       const team = data.team || [];
+      const streakRewards = Array.isArray(data.streak_rewards) ? data.streak_rewards : [];
       root.innerHTML = `
         <div class="arena-console">
           <div class="arena-header">
             <div><strong>${escapeHtml(modeLabel(data.mode || ''))}</strong><div class="muted">${validation.ok ? 'можно искать бой' : 'заблокировано условиями'}</div></div>
-            <div class="chips"><span class="chip ${validation.ok ? 'good' : 'warn'}">${validation.ok ? 'готово' : 'заблокировано'}</span><span class="chip">рейтинг команды ${pick(data.team_rating, '-')}</span></div>
+            <div class="chips"><span class="chip ${validation.ok ? 'good' : 'warn'}">${validation.ok ? 'готово' : 'заблокировано'}</span><span class="chip">рейтинг команды ${pick(data.team_rating, '-')}</span>${renderArenaStatusChips(data)}</div>
           </div>
           <div class="arena-scene">
             ${team.length ? `<div class="battle-team">${team.map(item => renderBattleMiscrit({...item, active:false})).join('')}</div>` : renderSearchScene('Команда пуста', 'Проверка условий не вернула данные команды')}
             ${renderArenaRewards(data.reward_progress)}
+            ${String(data.mode || '').toLowerCase() === 'platinum' ? renderPlatinumStreakRewards(streakRewards) : ''}
             ${(data.rules || []).length ? `<details class="collapsible" style="margin-top:14px"><summary>Условия</summary><div class="collapsible-body"><div class="chips">${data.rules.map(r => `<span class="chip">${escapeHtml(r)}</span>`).join('')}</div></div></details>` : ''}
           </div>
         </div>`;
+    }
+
+    function renderArenaStatusChips(data = {}) {
+      const mode = String(data.mode || '').toLowerCase();
+      const chips = [];
+      if (data.time_left !== undefined && data.time_left !== null) chips.push(`<span class="chip">сброс через ${escapeHtml(formatDuration(data.time_left))}</span>`);
+      if (mode === 'platinum') {
+        const cap = data.cap_target || 300;
+        chips.push(`<span class="chip">платина цикла ${escapeHtml(data.pa_cap || 0)} / ${escapeHtml(cap)}</span>`);
+        if (data.pa_streak !== undefined && data.pa_streak !== null) chips.push(`<span class="chip">серия ${escapeHtml(data.pa_streak)}</span>`);
+        if (data.pa_max_streak !== undefined && data.pa_max_streak !== null) chips.push(`<span class="chip">лучшая серия ${escapeHtml(data.pa_max_streak)}</span>`);
+        const streakRewards = Array.isArray(data.streak_rewards) ? data.streak_rewards : [];
+        chips.push(streakRewards.length ? `<span class="chip">streak-награды ${streakRewards.length}</span>` : '<span class="chip">streak-награды не загружены</span>');
+      }
+      return chips.join('');
     }
 
     function renderArenaLive(job) {
@@ -4903,11 +4976,12 @@ INDEX_HTML = """<!doctype html>
       const claimed = progress.claimed_totals || {};
       const remaining = progress.remaining_totals || {};
       const currencies = Object.keys(totals);
+      const unit = arenaProgressUnit(progress.unit);
       return `<section class="arena-rewards">
         <div class="log-head">
           <strong>Награды</strong>
           <div class="chips">
-            <span class="chip">${escapeHtml(pick(progress.progress, 0))} / ${escapeHtml(pick(progress.target, 0))} побед</span>
+            <span class="chip">${escapeHtml(pick(progress.progress, 0))} / ${escapeHtml(pick(progress.target, 0))} ${escapeHtml(unit)}</span>
           </div>
         </div>
         <div class="arena-reward-summary">
@@ -4915,6 +4989,27 @@ INDEX_HTML = """<!doctype html>
         </div>
         <div class="arena-reward-list">
           ${items.map(renderArenaRewardItem).join('')}
+        </div>
+      </section>`;
+    }
+
+    function renderPlatinumStreakRewards(items = []) {
+      if (!Array.isArray(items) || !items.length) return '';
+      return `<section class="arena-rewards">
+        <div class="log-head"><strong>Награды за серию побед</strong><span class="chip">${items.length}</span></div>
+        <div class="arena-reward-list">
+          ${items.map(item => {
+            const currency = String(item.currency || 'platinum').toLowerCase();
+            const label = `${item.amount || 0} ${arenaRewardLabel(currency)}`;
+            const detail = item.claimed ? 'получено' : `осталось побед: ${pick(item.remaining_wins, 0)}`;
+            return `<div class="arena-reward-item ${item.claimed ? 'claimed' : ''}">
+              <div class="arena-reward-icon">${currency === 'platinum' ? 'P' : escapeHtml(currency.slice(0, 1).toUpperCase())}</div>
+              <div>
+                <div class="log-head"><strong>${escapeHtml(label)}</strong><span class="chip ${item.claimed ? 'good' : ''}">серия ${escapeHtml(item.threshold || '?')}</span></div>
+                <div class="muted">${escapeHtml(detail)}</div>
+              </div>
+            </div>`;
+          }).join('')}
         </div>
       </section>`;
     }
@@ -4929,18 +5024,19 @@ INDEX_HTML = """<!doctype html>
 
     function renderArenaRewardItem(item = {}) {
       const currency = String(item.currency || '').toLowerCase();
+      const unit = arenaProgressUnit(item.unit);
       const name = currency === 'miscrit'
         ? (item.name || ('Мискрит #' + pick(item.mid, '?')))
         : `${item.amount || 0} ${arenaRewardLabel(currency)}`;
       const detail = item.claimed
         ? 'получено'
-        : `осталось побед: ${pick(item.remaining_wins, 0)}`;
+        : `осталось: ${pick(item.remaining_amount, item.remaining_wins || 0)} ${unit}`;
       const icon = arenaRewardIcon(item);
       return `<div class="arena-reward-item ${item.claimed ? 'claimed' : ''}">
         <div class="arena-reward-icon">${icon}</div>
         <div>
           <div class="log-head"><strong>${escapeHtml(name)}</strong><span class="chip ${item.claimed ? 'good' : ''}">${item.claimed ? 'получено' : 'заблокировано'}</span></div>
-          <div class="muted">${escapeHtml(pick(item.threshold, '?'))} побед / ${escapeHtml(detail)}</div>
+          <div class="muted">${escapeHtml(pick(item.threshold, '?'))} ${escapeHtml(unit)} / ${escapeHtml(detail)}</div>
         </div>
       </div>`;
     }
@@ -4955,6 +5051,10 @@ INDEX_HTML = """<!doctype html>
       if (currency === 'gems') return 'G';
       if (currency === 'gold') return '$';
       return escapeHtml(String(currency || '?').slice(0, 1).toUpperCase());
+    }
+
+    function arenaProgressUnit(unit) {
+      return String(unit || '').toLowerCase() === 'platinum' ? 'платины' : 'побед';
     }
 
     function arenaRewardLabel(currency) {
@@ -5485,6 +5585,18 @@ INDEX_HTML = """<!doctype html>
     function formatTime(ts) {
       if (!ts) return '';
       return new Date(ts * 1000).toLocaleString();
+    }
+
+    function formatDuration(seconds) {
+      const total = Math.max(0, Math.floor(Number(seconds) || 0));
+      const days = Math.floor(total / 86400);
+      const hours = Math.floor((total % 86400) / 3600);
+      const minutes = Math.floor((total % 3600) / 60);
+      const parts = [];
+      if (days) parts.push(`${days} д`);
+      if (hours || days) parts.push(`${hours} ч`);
+      parts.push(`${minutes} мин`);
+      return parts.join(' ');
     }
 
     function escapeHtml(value) {
