@@ -26,7 +26,7 @@ from ..auto_update import (
     resume_payload,
     save_resume_state,
 )
-from ..battle_learning import ai_dashboard, learning_status, load_battle_history, load_battle_log, load_battle_log_index, set_ai_weight
+from ..battle_learning import ai_dashboard, learning_status, load_battle_history, load_battle_log, load_battle_log_index, rebuild_learning_from_history, set_ai_weight
 from ..breeding import BreedConfig, BreedRunner, load_breed_logs
 from ..config import DATA_DIR
 from ..credentials import clear_credentials, credentials_status, save_credentials
@@ -45,6 +45,7 @@ MAX_ARENA_JOBS = 12
 PLAN_JOBS: dict[str, dict[str, Any]] = {}
 PLAN_JOBS_LOCK = threading.RLock()
 AUTO_UPDATE_LOCK = threading.RLock()
+AI_REPLAY_LOCK = threading.RLock()
 AUTO_UPDATE_INTERVAL_SECONDS = 300.0
 AUTO_UPDATE_STATE: dict[str, Any] = {
     "phase": "idle",
@@ -52,6 +53,13 @@ AUTO_UPDATE_STATE: dict[str, Any] = {
     "last_result": {},
     "target_tag": "",
     "error": "",
+}
+AI_REPLAY_STATE: dict[str, Any] = {
+    "phase": "idle",
+    "started_at": 0.0,
+    "finished_at": 0.0,
+    "error": "",
+    "summary": {},
 }
 
 
@@ -133,16 +141,19 @@ class MiscritsWebHandler(BaseHTTPRequestHandler):
             self._handle_plan_live((query.get("account_id") or [""])[0])
             return
         if parsed.path == "/api/battle-learning":
-            self._send_json(learning_status())
+            self._send_json(learning_status(ensure_schema=False))
             return
         if parsed.path == "/api/ai-dashboard":
-            self._send_json(ai_dashboard())
+            self._send_json(ai_dashboard(ensure_schema=False))
+            return
+        if parsed.path == "/api/ai-replay-status":
+            self._send_json({"ok": True, **ai_replay_status()})
             return
         if parsed.path == "/api/battle-history":
             query = parse_qs(parsed.query)
             raw_limit = (query.get("limit") or ["50"])[0]
             limit = None if str(raw_limit).strip().lower() in {"all", "0", "-1"} else int(raw_limit or 50)
-            self._send_json({"ok": True, "history": list(reversed(load_battle_history(limit)))})
+            self._send_json({"ok": True, "history": list(reversed(load_battle_history(limit, ensure_schema=False)))})
             return
         if parsed.path == "/api/battle-logs":
             query = parse_qs(parsed.query)
@@ -156,6 +167,7 @@ class MiscritsWebHandler(BaseHTTPRequestHandler):
                         mode=(query.get("mode") or [""])[0],
                         outcome=(query.get("outcome") or [""])[0],
                         text=(query.get("text") or [""])[0],
+                        ensure_schema=False,
                     ),
                 }
             )
@@ -163,7 +175,7 @@ class MiscritsWebHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/battle-log":
             query = parse_qs(parsed.query)
             battle_id = (query.get("id") or [""])[0]
-            log = load_battle_log(battle_id)
+            log = load_battle_log(battle_id, ensure_schema=False)
             self._send_json({"ok": bool(log), "battle": log} if log else {"ok": False, "error": "Battle log not found"}, HTTPStatus.OK if log else HTTPStatus.NOT_FOUND)
             return
         if parsed.path == "/api/logs":
@@ -288,6 +300,9 @@ class MiscritsWebHandler(BaseHTTPRequestHandler):
                 self._send_json({"ok": True, "entry": entry, "dashboard": ai_dashboard()})
             except (TypeError, ValueError) as exc:
                 self._send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            return
+        if parsed.path == "/api/ai-replay-train":
+            self._send_json(start_ai_replay_training())
             return
         self._send_json({"error": "not found"}, HTTPStatus.NOT_FOUND)
 
@@ -1419,6 +1434,67 @@ def current_plan_job_unlocked(account_id: str = "") -> dict[str, Any] | None:
 def auto_update_status() -> dict[str, Any]:
     with AUTO_UPDATE_LOCK:
         return json.loads(json.dumps(AUTO_UPDATE_STATE, ensure_ascii=False))
+
+
+def ai_replay_status() -> dict[str, Any]:
+    with AI_REPLAY_LOCK:
+        return json.loads(json.dumps(AI_REPLAY_STATE, ensure_ascii=False))
+
+
+def start_ai_replay_training() -> dict[str, Any]:
+    with AI_REPLAY_LOCK:
+        if AI_REPLAY_STATE.get("phase") == "running":
+            return {"ok": True, "already_running": True, **json.loads(json.dumps(AI_REPLAY_STATE, ensure_ascii=False))}
+        AI_REPLAY_STATE.update(
+            {
+                "phase": "running",
+                "started_at": time.time(),
+                "finished_at": 0.0,
+                "error": "",
+                "summary": {},
+            }
+        )
+    threading.Thread(target=run_ai_replay_training, name="ai-replay-training", daemon=True).start()
+    return {"ok": True, **ai_replay_status()}
+
+
+def run_ai_replay_training() -> None:
+    log_event(
+        "ai_replay_training_started",
+        category="ai",
+        source="web",
+        initiator="user",
+    )
+    try:
+        summary = rebuild_learning_from_history()
+    except Exception as exc:  # noqa: BLE001 - surfaced in web status and event log.
+        with AI_REPLAY_LOCK:
+            AI_REPLAY_STATE.update({"phase": "error", "finished_at": time.time(), "error": str(exc)})
+        log_event(
+            "ai_replay_training_failed",
+            category="ai",
+            level="error",
+            source="web",
+            initiator="user",
+            reason=str(exc),
+        )
+        return
+    with AI_REPLAY_LOCK:
+        AI_REPLAY_STATE.update(
+            {
+                "phase": "done",
+                "finished_at": time.time(),
+                "error": "",
+                "summary": summary,
+            }
+        )
+    log_event(
+        "ai_replay_training_finished",
+        category="ai",
+        source="web",
+        initiator="user",
+        payload=summary,
+    )
 
 
 def start_auto_update_monitor() -> None:
@@ -3116,8 +3192,12 @@ INDEX_HTML = """<!doctype html>
         <section class="panel">
           <div class="log-head">
             <h3 style="margin:0">Панель AI</h3>
-            <button class="ghost" onclick="loadAiDashboard()">Обновить AI</button>
+            <div class="row">
+              <button class="ghost" onclick="loadAiDashboard()">Обновить AI</button>
+              <button onclick="startAiReplayTraining()">Обучить по replay</button>
+            </div>
           </div>
+          <div id="aiReplayStatus" class="muted" style="margin-top:10px">Replay-обучение ещё не запускалось</div>
           <div id="aiDashboard" class="ai-dashboard muted" style="margin-top:12px">Данные AI ещё не загружены</div>
         </section>
       </div>
@@ -3211,6 +3291,7 @@ INDEX_HTML = """<!doctype html>
     let arenaPollTimer = null;
     let logPollTimer = null;
     let planPollTimer = null;
+    let aiReplayPollTimer = null;
     let planBlocks = [];
     let statusPollTimer = null;
     let lastPlanBattleRefreshKey = '';
@@ -3779,6 +3860,57 @@ INDEX_HTML = """<!doctype html>
     async function loadAiDashboard() {
       const data = await fetchJson('/api/ai-dashboard');
       if (data.ok) renderAiDashboard(data);
+      loadAiReplayStatus(false);
+    }
+
+    async function startAiReplayTraining() {
+      const data = await api('/api/ai-replay-train', { method: 'POST' }, true);
+      renderAiReplayStatus(data);
+      scheduleAiReplayStatus();
+    }
+
+    async function loadAiReplayStatus(schedule = true) {
+      const data = await fetchJson('/api/ai-replay-status');
+      renderAiReplayStatus(data);
+      if (schedule && data.phase === 'running') scheduleAiReplayStatus();
+      if (schedule && data.phase === 'done') loadAiDashboard();
+    }
+
+    function scheduleAiReplayStatus() {
+      if (aiReplayPollTimer) clearTimeout(aiReplayPollTimer);
+      aiReplayPollTimer = setTimeout(() => loadAiReplayStatus(true), 1500);
+    }
+
+    function renderAiReplayStatus(data = {}) {
+      const root = document.getElementById('aiReplayStatus');
+      if (!root) return;
+      const phase = data.phase || 'idle';
+      const summary = data.summary || {};
+      const exploration = summary.exploration_model || {};
+      const rank = summary.rank_model || {};
+      const value = summary.value_model || {};
+      if (phase === 'running') {
+        root.innerHTML = `<span class="chip warn">обучение replay</span> <span class="muted">идёт пересборка истории и exploration priors</span>`;
+        return;
+      }
+      if (phase === 'error') {
+        root.innerHTML = `<span class="chip warn">ошибка replay</span> <span class="muted">${escapeHtml(data.error || '')}</span>`;
+        return;
+      }
+      if (phase === 'done') {
+        root.innerHTML = `
+          <div class="chips">
+            <span class="chip good">replay готов</span>
+            <span class="chip">боёв ${escapeHtml(summary.history_count || 0)}</span>
+            <span class="chip">value ${escapeHtml(value.unique_samples || 0)}</span>
+            <span class="chip">rank used ${escapeHtml(rank.rank_training_pairs_used || 0)}</span>
+            <span class="chip">rank skipped ${escapeHtml(rank.rank_training_pairs_skipped || 0)}</span>
+            <span class="chip">explore contexts ${escapeHtml(exploration.contexts || 0)}</span>
+            <span class="chip">explore samples ${escapeHtml(exploration.samples || 0)}</span>
+          </div>`;
+        return;
+      }
+      root.textContent = 'Replay-обучение ещё не запускалось';
     }
 
     async function saveAiWeight(category, key, inputId) {
@@ -5167,6 +5299,7 @@ INDEX_HTML = """<!doctype html>
       const reasons = data.decision_reasons || [];
       const actions = data.decision_actions || [];
       const damage = data.damage_model || {};
+      const exploration = data.exploration_model || {};
       const editable = data.editable_weights || {};
       root.classList.remove('muted');
       root.innerHTML = `
@@ -5177,6 +5310,8 @@ INDEX_HTML = """<!doctype html>
           <div class="ai-metric"><span class="muted">Bucket-ы соперника</span><strong>${escapeHtml(logic.opponent_learning_buckets || 0)}</strong></div>
           <div class="ai-metric"><span class="muted">Примеры урона</span><strong>${escapeHtml(damage.samples || 0)}</strong></div>
           <div class="ai-metric"><span class="muted">Ошибка урона MAPE</span><strong>${Math.round(Number(damage.mape || 0) * 100)}%</strong></div>
+          <div class="ai-metric"><span class="muted">Replay-варианты</span><strong>${escapeHtml(exploration.samples || 0)}</strong></div>
+          <div class="ai-metric"><span class="muted">Контексты вариативности</span><strong>${escapeHtml(exploration.contexts || 0)}</strong></div>
         </div>
         <div class="grid-2">
           <div class="log-card ai-chart">
@@ -5210,6 +5345,10 @@ INDEX_HTML = """<!doctype html>
           <div class="log-card ai-chart">
             <div class="log-head"><strong>Модель урона</strong><span class="chip">глобально x${Number((damage.global && damage.global.scale) || 1).toFixed(3)}</span></div>
             ${renderAiBars((damage.top_buckets || []).slice(0, 12), 'scale', true)}
+          </div>
+          <div class="log-card ai-chart">
+            <div class="log-head"><strong>Replay-вариативность</strong><span class="chip">${escapeHtml(exploration.actions || 0)} действий</span></div>
+            ${renderAiBars((exploration.top_actions || []).slice(0, 12), 'weight', false, aiActionLabel)}
           </div>
         </div>
         <div class="log-card">

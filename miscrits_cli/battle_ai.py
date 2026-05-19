@@ -4,7 +4,7 @@ import random
 import re
 from typing import Any
 
-from .battle_learning import action_rank_estimate, action_value_estimate, damage_kind_for_action, damage_multiplier, learned_bonus, matchup_memory, reason_tags
+from .battle_learning import action_exploration_prior, action_rank_estimate, action_value_estimate, damage_kind_for_action, damage_multiplier, learned_bonus, matchup_memory, reason_tags
 
 
 BATTLE_OPCODES = {
@@ -76,8 +76,11 @@ LAST_FOE_FINISH_BONUS = 90.0
 LAST_ALLY_LONG_BUFF_PENALTY = 120.0
 MAX_UTILITY_STREAK = 2
 ATTACK_FOLLOWUP_RATIO = 0.72
-ABILITY_EXPLORATION_RATE = 0.08
-ABILITY_EXPLORATION_GAP = 18.0
+ABILITY_EXPLORATION_RATE = 0.12
+ABILITY_EXPLORATION_GAP = 22.0
+ABILITY_EXPLORATION_MAX_RANK = 3
+ABILITY_EXPLORATION_MAX_RISK = 0.58
+ABILITY_EXPLORATION_MAX_INCOMING = 0.42
 LOOKAHEAD_OPPONENT_WEIGHT = 0.62
 LOOKAHEAD_FINISH_BONUS = 34.0
 LOOKAHEAD_DEATH_PENALTY = 72.0
@@ -225,7 +228,10 @@ class BattleState:
                 "reason_tags": ability_choice.get("reason_tags", reason_tags(ability_choice.get("reason", ""))),
                 "action_type": ability_choice.get("type", "ability"),
                 "chosen_probability": ability_choice.get("chosen_probability", 1.0),
+                "policy_probability": ability_choice.get("policy_probability", ability_choice.get("chosen_probability", 1.0)),
                 "candidate_rank": ability_choice.get("candidate_rank", 0),
+                "exploration_reason": ability_choice.get("exploration_reason", ""),
+                "score_gap": ability_choice.get("score_gap", 0.0),
                 "debug": ability_choice,
             }
         if switch_choice["id"] and not bool(switch_choice.get("lethal_incoming", False)):
@@ -486,6 +492,9 @@ class BattleState:
             best["reason"] = "lethal_finish" if bool(best.get("lethal", False)) else "near_lethal_pressure"
             best["reason_tags"] = [best["reason"]]
             best["chosen_probability"] = 1.0
+            best["policy_probability"] = 1.0
+            best["exploration_reason"] = "blocked_finisher"
+            best["score_gap"] = 0.0
             return {**best, "candidates": ranked}
         best = ranked[0]
         best_attack = next((item for item in ranked if str(item.get("type", "") or "") == "Attack"), None)
@@ -500,6 +509,9 @@ class BattleState:
                 forced["reason"] = "forced_attack_after_utility" if utility_streak >= MAX_UTILITY_STREAK else "attack_followup"
                 forced["reason_tags"] = [forced["reason"]]
                 forced["chosen_probability"] = 1.0
+                forced["policy_probability"] = 1.0
+                forced["exploration_reason"] = "blocked_forced_attack"
+                forced["score_gap"] = round(best_score - attack_score, 3)
                 forced["utility_streak_before"] = utility_streak
                 forced["attack_followup_ratio"] = followup_ratio
                 return {**forced, "candidates": ranked}
@@ -511,6 +523,9 @@ class BattleState:
             explored["exploration"] = True
             return {**explored, "candidates": ranked}
         best["chosen_probability"] = best.get("chosen_probability", deterministic_ability_probability(ranked, plan or {}))
+        best["policy_probability"] = best.get("policy_probability", best["chosen_probability"])
+        best["exploration_reason"] = best.get("exploration_reason", "exploit_best")
+        best["score_gap"] = 0.0
         return {**best, "reason": best.get("reason", "best_scored_ability"), "candidates": ranked}
 
     def _utility_streak(self, active: dict[str, Any], foe: dict[str, Any]) -> int:
@@ -533,8 +548,16 @@ def exploratory_ability_choice(ranked: list[dict[str, Any]], plan: dict[str, Any
         return {}
     chosen = dict(random.choices(pool, weights=weights, k=1)[0])
     total_weight = sum(weights)
-    chosen_weight = weights[pool.index(next(item for item in pool if int(item.get("id", 0) or 0) == int(chosen.get("id", 0) or 0)))]
-    chosen["chosen_probability"] = rate * chosen_weight / max(0.000001, total_weight)
+    chosen_index = pool.index(next(item for item in pool if int(item.get("id", 0) or 0) == int(chosen.get("id", 0) or 0)))
+    chosen_weight = weights[chosen_index]
+    policy_probability = rate * chosen_weight / max(0.000001, total_weight)
+    best_score = float(ranked[0].get("score", 0.0) or 0.0)
+    score_gap = max(0.0, best_score - float(chosen.get("score", 0.0) or 0.0))
+    chosen["chosen_probability"] = policy_probability
+    chosen["policy_probability"] = policy_probability
+    replay_bonus = float(chosen.get("replay_exploration_bonus", 1.0) or 1.0)
+    chosen["exploration_reason"] = "safe_replay_rank_alt" if replay_bonus > 1.0 else "safe_close_rank_alt"
+    chosen["score_gap"] = round(score_gap, 3)
     return chosen
 
 
@@ -545,18 +568,28 @@ def ability_exploration_policy(ranked: list[dict[str, Any]], plan: dict[str, Any
     best_score = float(best.get("score", 0.0) or 0.0)
     if bool(best.get("lethal", False)) or bool(best.get("near_lethal", False)):
         return 0.0, [], []
+    if bool(plan.get("last_ally", False)) or bool(plan.get("last_foe", False)):
+        return 0.0, [], []
+    if candidate_risk_ratio(best) >= ABILITY_EXPLORATION_MAX_RISK:
+        return 0.0, [], []
+    if candidate_incoming_ratio(best) >= ABILITY_EXPLORATION_MAX_INCOMING:
+        return 0.0, [], []
     rate = ABILITY_EXPLORATION_RATE
     if bool(plan.get("ahead", False)):
-        rate *= 0.55
+        rate *= 0.75
     if bool(plan.get("behind", False)):
-        rate *= 1.7
-    if bool(plan.get("last_ally", False)) or bool(plan.get("last_foe", False)):
-        rate *= 0.6
-    rate = min(0.18, max(0.0, rate))
+        rate *= 0.85
+    rate = min(0.12, max(0.0, rate))
     pool = []
-    for item in ranked[1:6]:
+    for item in ranked[1:ABILITY_EXPLORATION_MAX_RANK]:
         score = float(item.get("score", 0.0) or 0.0)
         if bool(item.get("immune_blocked", False)) or bool(item.get("redundant", False)):
+            continue
+        if bool(item.get("lethal", False)) or bool(item.get("near_lethal", False)):
+            continue
+        if candidate_risk_ratio(item) >= ABILITY_EXPLORATION_MAX_RISK:
+            continue
+        if candidate_incoming_ratio(item) >= ABILITY_EXPLORATION_MAX_INCOMING:
             continue
         if best_score - score > ABILITY_EXPLORATION_GAP:
             continue
@@ -566,13 +599,44 @@ def ability_exploration_policy(ranked: list[dict[str, Any]], plan: dict[str, Any
     if not pool:
         return 0.0, [], []
     floor = min(float(item.get("score", 0.0) or 0.0) for item in pool)
-    weights = [max(0.2, float(item.get("score", 0.0) or 0.0) - floor + 1.0) for item in pool]
+    weights = []
+    replay_confidence = 0.0
+    for item in pool:
+        prior = action_exploration_prior(
+            item.get("value_features", {}) if isinstance(item.get("value_features"), dict) else {},
+            int(item.get("id", 0) or 0),
+            str(item.get("type", "") or ""),
+        )
+        bonus = float(prior.get("bonus", 1.0) or 1.0)
+        confidence = float(prior.get("confidence", 0.0) or 0.0)
+        replay_confidence = max(replay_confidence, confidence)
+        item["replay_exploration_bonus"] = round(bonus, 4)
+        item["replay_exploration_confidence"] = round(confidence, 4)
+        weights.append(max(0.2, float(item.get("score", 0.0) or 0.0) - floor + 1.0) * bonus)
+    if replay_confidence >= 0.12:
+        rate = min(0.12, rate * (1.0 + min(0.35, replay_confidence * 0.35)))
     return rate, pool, weights
 
 
 def deterministic_ability_probability(ranked: list[dict[str, Any]], plan: dict[str, Any]) -> float:
     rate, pool, _ = ability_exploration_policy(ranked, plan)
     return 1.0 - rate if pool else 1.0
+
+
+def candidate_risk_ratio(candidate: dict[str, Any]) -> float:
+    features = candidate.get("value_features", {}) if isinstance(candidate.get("value_features"), dict) else {}
+    return max(
+        float(candidate.get("risk_ratio", 0.0) or 0.0),
+        float(features.get("risk_ratio", 0.0) or 0.0),
+    )
+
+
+def candidate_incoming_ratio(candidate: dict[str, Any]) -> float:
+    features = candidate.get("value_features", {}) if isinstance(candidate.get("value_features"), dict) else {}
+    return max(
+        float(candidate.get("incoming_ratio", 0.0) or 0.0),
+        float(features.get("incoming_ratio", 0.0) or 0.0),
+    )
 
 
 def winner_from_actions(data: dict[str, Any]) -> str:
@@ -889,6 +953,8 @@ def score_ability(ability: dict[str, Any], attacker: dict[str, Any], defender: d
         "damage": round(damage, 3),
         "accuracy": round(accuracy, 3),
         "utility": round(utility, 3),
+        "incoming_ratio": round(incoming / max(1.0, float(max_hp(attacker))), 5),
+        "risk_ratio": round(incoming / max(1.0, float(self_hp)), 5),
         "lethal": damage >= defender_hp > 0,
         "near_lethal": damage >= defender_hp * 0.92 > 0 and is_damage_ability(effective),
         "redundant": redundant,
